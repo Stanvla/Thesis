@@ -1,0 +1,10 @@
+*.idea
+*.pickle
+*.csv
+*.mp3
+*.wav
+/.ipynb_checkpoints
+*.history-stankov
+
+
+
