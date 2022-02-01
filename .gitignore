@@ -3,7 +3,7 @@
 *.csv
 *.mp3
 *.wav
-/.ipynb_checkpoints
+.ipynb_checkpoints/
 *.history-stankov
 
 
