@@ -1,0 +1,9 @@
+#$ -pe smp 1
+#$ -l mem_free=12G,act_mem_free=12G,h_vmem=16G
+#$ -N merge{}.sh
+#$ -wd /lnet/express/work/people/stankov/alignment/Thesis/HuBERT/clustering/jobs/scripts
+#$ -j y
+#$ -p -200
+#$ -m n
+sleep {}
+source /lnet/express/work/people/stankov/python-venvs/torch-gpu/bin/activate

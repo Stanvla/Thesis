@@ -1,0 +1,52 @@
+# ==============================================================================================================================================
+# =============================================================== QSUB OPTIONS =================================================================
+# ==============================================================================================================================================
+
+# number of CPUs
+
+#$ -pe smp 4
+# ............................................................................................
+
+# act_mem_free - specifies the real amount of free memory (at the time of scheduling).
+#                You can specify it when submitting a job and it will be scheduled to a machine with at least this amount of memory free
+# mem_free -  specifies a consumable resource tracked by SGE and it affects job scheduling.
+#             Each machine has an initial value assigned (slightly lower than the real total physical RAM capacity).
+#             When you specify qsub -l mem_free=4G, SGE finds a machine with mem_free >= 4GB, and subtracts 4GB from it. 
+#             This limit is not enforced, so if a job exceeds this limit, it is not automatically killed and thus the SGE value of mem_free may not represent the real free memory
+# h_vmem - hard limit on the size of virtual memory.
+#          If your job exceeds this limit, memory allocation fails (i.e., malloc or mmap will return NULL), and your job will probably crash on SIGSEGV.
+
+#$ -l mem_free=12G,act_mem_free=12G,h_vmem=16G
+# ............................................................................................
+
+# job name
+
+#$ -N script_9.sh
+# ............................................................................................
+
+# working directory
+
+#$ -wd /lnet/express/work/people/stankov/alignment/results/full/time-extracted/jobs
+# ............................................................................................
+
+# stdout and stderr outputs are merged and redirected to a file (''script.sh.o$JOB_ID'')
+
+#$ -j y
+# ............................................................................................
+
+# priority of your job as a number between -1024 and -100, -100 is default
+# priority between -99 and 0 is for urgent jobs taking less than a few hours
+
+#$ -p -800
+# ............................................................................................
+
+# Specify the emails where you want to be notified,  -m n to override the defaults and send no emails
+
+#$ -m n
+
+# ================================================================================================================================================
+# =============================================================== SHELL COMMANDS =================================================================
+# ================================================================================================================================================
+
+source /home/stankov/alignment/bin/activate
+python /lnet/express/work/people/stankov/alignment/single_time_extractor.py --id=9 --vertical=/lnet/express/work/people/stankov/alignment/results/full/merged/2015040715581612.vert --mp3=/lnet/spec/work/people/kopp/ParCzech/psp.cz/mp3/original_files/www.psp.cz/eknih/2013ps/audio/2015/04/07/2015040715581612.mp3 --out_base=/lnet/express/work/people/stankov/alignment/results/full/time-extracted/jan --aligner_script_file=main.sh --aligner_script_dir=/home/kruza/svolocz/align/  --working_directory=/lnet/express/work/people/stankov/alignment/results/full/time-extracted/jobs/2015040715581612
