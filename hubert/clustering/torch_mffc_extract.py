@@ -147,6 +147,7 @@ class SaveResultsCB(pl.Callback):
         # count how many df written to disk
         self.cnt = 0
         self.resample_rate = resample_rate
+        self. total_duration_sec = 0
 
     def extract_name(self, path):
         if self.df_type == 'common_voice':
@@ -178,18 +179,14 @@ class SaveResultsCB(pl.Callback):
 
             features_df = pd.DataFrame(data=features)
             features_df['path'] = self.extract_name(path)
-            old_duration = wav_len/self.resample_rate * 1000
-            duration = new_wav_len/self.resample_rate * 1000
-
-            error = abs(20 - duration / n_frames) * n_frames
-            print(f'{self.extract_name(path)} :: (old duration {old_duration:.1f}ms) new {duration:.1f}ms and with {n_frames} frames =>'
-                  f' {duration / n_frames:.2f}, error will be {error:.2f}ms')
+            self.total_duration_sec += new_wav_len/self.resample_rate
             self.dataframes.append(features_df)
 
             if self.current_buffer >= self.buffer_size:
                 self.write_df(trainer)
 
     def on_predict_epoch_end(self, trainer, pl_module, outputs):
+        print(f'{self.total_duration_sec // 60}::{self.total_duration_sec % 60:.2f}')
         if self.dataframes != []:
             self.write_df(trainer)
 
@@ -256,6 +253,7 @@ if __name__ == '__main__':
         buffer_size=50000,
         df_type='common_voice',
         frame_length_ms=20,
+        data_type='validated'
     )
 
     parczech_clean_params = dict(
@@ -264,13 +262,14 @@ if __name__ == '__main__':
         duration__segments_lb=0.5,
     )
     # dataset = ParCzechDataset(parczech_df_path, resample_rate=params['resample_rate'], clean_params=parczech_clean_params)
-    dataset = CommonVoiceDataset(common_voice_base_dir, 'train', params['resample_rate'])
+    dataset = CommonVoiceDataset(common_voice_base_dir, params['data_type'], params['resample_rate'])
     dataloader = DataLoader(dataset, batch_size=params['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=os.cpu_count() // 4, pin_memory=True)
     extractor = MFCCExtractorPL(n_mffcs=params['n_mffcs'], n_mels=params['n_mels'], n_fft=params['n_fft'], f_max=params['resample_rate']// 2,
                                 output_dir=output_dir, resample_rate=params['resample_rate'])
 
 
-    cb = SaveResultsCB(output_dir, params['n_fft'], buffer_size=params['buffer_size'], df_type=params['df_type'], frame_length=params['frame_length_ms'])
-    trainer = pl.Trainer(gpus=-1, strategy='ddp', num_sanity_val_steps=0, callbacks=cb, precision=16, deterministic=True, progress_bar_refresh_rate=0)
+    cb = SaveResultsCB(output_dir, params['n_fft'], buffer_size=params['buffer_size'], df_type=params['df_type'], frame_length=params['frame_length_ms'], )
+    trainer = pl.Trainer(gpus=-1, strategy='ddp', num_sanity_val_steps=0, callbacks=cb, precision=16, deterministic=True)
+    # trainer = pl.Trainer(gpus=1, num_sanity_val_steps=0, callbacks=cb, precision=16, deterministic=True, limit_predict_batches=10)
     trainer.predict(extractor, dataloader)
 
