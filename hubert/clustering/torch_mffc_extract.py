@@ -3,6 +3,7 @@ import logging
 import os.path
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
@@ -133,17 +134,19 @@ class MFCCExtractorPL(pl.LightningModule):
 
 
 class SaveResultsCB(pl.Callback):
-    def __init__(self, target_path, n_fft, buffer_size, df_type):
+    def __init__(self, target_path, n_fft, buffer_size, df_type, resample_rate=16000, frame_length=20):
         self.df_type = df_type
         self.output_dir = target_path
         self.n_fft = n_fft
         # number of frames to store at one csv
         self.buffer_size = buffer_size
+        self.frame_length = frame_length
 
         self.dataframes = []
         self.current_buffer = 0
         # count how many df written to disk
         self.cnt = 0
+        self.resample_rate = resample_rate
 
     def extract_name(self, path):
         if self.df_type == 'common_voice':
@@ -167,7 +170,7 @@ class SaveResultsCB(pl.Callback):
         _, paths, lengths = batch
         outputs = outputs.cpu().numpy()
         for wav_len, features, path in zip(lengths, outputs, paths):
-            n_frames = compute_frames(wav_len, self.n_fft)
+            n_frames, new_wav_len = compute_frames(wav_len, self.n_fft, self.frame_length, self.resample_rate)
             self.current_buffer += n_frames
 
             # select only useful frames without padding
@@ -175,6 +178,12 @@ class SaveResultsCB(pl.Callback):
 
             features_df = pd.DataFrame(data=features)
             features_df['path'] = self.extract_name(path)
+            old_duration = wav_len/self.resample_rate * 1000
+            duration = new_wav_len/self.resample_rate * 1000
+
+            error = abs(20 - duration / n_frames) * n_frames
+            print(f'{self.extract_name(path)} :: (old duration {old_duration:.1f}ms) new {duration:.1f}ms and with {n_frames} frames =>'
+                  f' {duration / n_frames:.2f}, error will be {error:.2f}ms')
             self.dataframes.append(features_df)
 
             if self.current_buffer >= self.buffer_size:
@@ -185,8 +194,14 @@ class SaveResultsCB(pl.Callback):
             self.write_df(trainer)
 
 
-def compute_frames(wave_len, n_fft):
-    return 2 * wave_len // n_fft
+def compute_frames(wave_len, n_fft, frame_length, sample_rate):
+    if wave_len % frame_length == 0:
+        return 2 * wave_len // n_fft, wave_len
+    else:
+        # modification if wave length is not divisible by frame length, I would slightly increase wave length (adding one more frame)
+        frames = (2 * wave_len // n_fft) + 1
+        duration_sec = frames * frame_length / 1000
+        return frames, duration_sec * sample_rate
 
 
 def collate_fn(batch):
@@ -237,9 +252,10 @@ if __name__ == '__main__':
         batch_size=60,
         n_mffcs=13,
         n_mels=40,
-        n_fft=400,
+        n_fft=640,
         buffer_size=50000,
         df_type='common_voice',
+        frame_length_ms=20,
     )
 
     parczech_clean_params = dict(
@@ -254,7 +270,7 @@ if __name__ == '__main__':
                                 output_dir=output_dir, resample_rate=params['resample_rate'])
 
 
-    cb = SaveResultsCB(output_dir, params['n_fft'], buffer_size=params['buffer_size'], df_type=params['df_type'])
-    trainer = pl.Trainer(gpus=-1, strategy='ddp', num_sanity_val_steps=0, callbacks=cb, precision=16, deterministic=True)
+    cb = SaveResultsCB(output_dir, params['n_fft'], buffer_size=params['buffer_size'], df_type=params['df_type'], frame_length=params['frame_length_ms'])
+    trainer = pl.Trainer(gpus=-1, strategy='ddp', num_sanity_val_steps=0, callbacks=cb, precision=16, deterministic=True, progress_bar_refresh_rate=0)
     trainer.predict(extractor, dataloader)
 
