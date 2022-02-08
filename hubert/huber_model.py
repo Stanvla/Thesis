@@ -5,17 +5,19 @@ import torchaudio
 from icecream import ic
 from pytorch_lightning.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
 from torch import nn
+from collections import OrderedDict
 import torch.nn.functional as F
 
 
 class HubertPretrainPL(pl.LightningModule):
-    def __init__(self, hubert_model, cluster_sizes, proj_dim, loss_weight, hubert_features=768, p=0.08, l=10):
+    def __init__(self, hubert_model, cluster_sizes, proj_dim, loss_weight, hubert_features=768, p=0.08, l=10, ignore_index=-1):
         super().__init__()
         # can access Conv feature extractor using hubert_base_model.feature_extractor and BERT using hubert_base_model.encoder
         # extractor takes audios and lengths and returns features and new lengths
         # encoder takes features and lengths and returns only new features
         # https://github.com/pytorch/audio/tree/main/torchaudio/models/wav2vec2
         self.hubert_model = hubert_model
+        self.ignore_index = ignore_index
         self.p = p
         self.l = l
         self.mask = 0
@@ -23,7 +25,11 @@ class HubertPretrainPL(pl.LightningModule):
         self.cluster_sizes = cluster_sizes
         self.proj_dim = proj_dim
         self.proj_layer = nn.Linear(in_features=hubert_features, out_features=proj_dim)
-        self.cluster_proj_layers = nn.ModuleDict({k: nn.Embedding(num_embeddings=k, embedding_dim=proj_dim) for k in cluster_sizes})
+        self.cluster_proj_layers = nn.ModuleDict(
+            OrderedDict(
+                ((f'{k}', nn.Embedding(num_embeddings=k, embedding_dim=proj_dim)) for k in cluster_sizes)
+            )
+        )
 
     def _mask_span(self, feature_batch, frames_cnt):
         masked_batch = []
@@ -43,21 +49,18 @@ class HubertPretrainPL(pl.LightningModule):
         return torch.stack(masked_batch), batch_mask_indices
 
     def forward(self, inputs, wave_lens, inference=True):
-        features_batch, frames_cnt = hubert_base_model.feature_extractor()
+        features_batch, frames_cnt = hubert_base_model.feature_extractor(inputs, wave_lens)
         batch_mask_indices = None
         if not inference:
             features_batch, batch_mask_indices = self._mask_span(features_batch, frames_cnt)
 
-        encoder_features = self.hubert_model.encdoer(features_batch, wave_lens)
+        encoder_features = self.hubert_model.encoder(features_batch, wave_lens)
         projected_features = self.proj_layer(encoder_features)
-        return projected_features, wave_lens, batch_mask_indices
+        return projected_features, frames_cnt, batch_mask_indices
 
-    def _loss(self, projected_features, n_frames, targets, batch_mask_indices):
+    def _compute_cos_sim(self, projected_features):
         # projected_features.shape = [batch, n_frames, proj_dim]
-        # targets.shape = [batch, n_frames]
-        # n_frames.shape = [batch, ]
-        # batch_mask_indices is a list, batch_mask_indices[i] = torch tensor with indices where span mask was applied
-        embedded_targets = {k: self.cluster_proj_layers[k](torch.arange(k)) for k in self.cluster_sizes}
+        embedded_targets = {k: layer(torch.arange(k)) for k, layer in zip(self.cluster_sizes, self.cluster_proj_layers.values())}
 
         # compute cosine similarity for each k-means model
         # how to use cosine similarity correctly https://github.com/pytorch/pytorch/issues/11202#issuecomment-997138697
@@ -73,31 +76,55 @@ class HubertPretrainPL(pl.LightningModule):
                 dim=-1  # common dimension
             )
             # similarity_scores[k].shape = [batch, n_frames, k]
+        return similarity_scores
 
-        # To address the second decision, we denote the cross-entropy loss computed over masked time steps as Lm.
-        # Lm(f; X, M, Z) = \sum_{t∈M} log p_f (z_t | \tilde X, t )
+    def _compute_loss(self, similarity_scores, frames_cnt, targets, batch_mask_indices):
+        # targets.shape = [n_clusterings, batch, n_frames]
+        # n_frames.shape = [batch, ]
+        # batch_mask_indices is a list, batch_mask_indices[i] = torch tensor with indices where span mask was applied
 
-        # The input is expected to contain raw, unnormalized scores for each class.
-        # input has to be a Tensor of size either (minibatch, C) or (minibatch, C, d_1, d_2, ..., d_K) with K ≥ 1 for the K-dimensional case.
-        losses = []
-        for (k, scores), target, seq_len, index_mask in zip(similarity_scores.items(), targets, n_frames, batch_mask_indices):
-            # scores.shape = [n_frames, k]
-            # target.shape = [n_frames]
-            # index_mask.shape = [n_masked_frames] ... differs for each sequence
-            # seq_len is an int
-            loss = F.cross_entropy(reduction='sum')
+        # cross_entropy recap
+        #   The input is expected to contain raw, unnormalized scores for each class.
+        #   input has to be a Tensor of size either (minibatch, C).
+        total_loss = 0
+        # iterate over different clustering models
+        for (k, scores), k_target in zip(similarity_scores.items(), targets):
+            # scores.shape = [batch, n_frames, k]
+            clustering_loss = 0
+            # iterate over sequences in the batch
+            for seq_score, target, seq_len, index_mask in zip(scores, k_target, frames_cnt, batch_mask_indices):
+                # seq_score.shape = [n_frames, k]
+                # target.shape = [n_frames]
+                # index_mask.shape = [n_masked_frames] ... differs for each sequence, that is why processing each seq separately
+                # seq_len is an int
 
+                valid_seq_score = seq_score[:seq_len]
+                target = target[:seq_len]
+                # valid_seq_score.shape = [seq_len, k]
+                # cross entropy loss over masked frames
+                mask_loss = F.cross_entropy(valid_seq_score[index_mask], target[index_mask], reduction='sum', ignore_index=self.ignore_index)
 
+                # cross entropy loss over frames without mask
+                index_unmask = torch.ones(valid_seq_score.shape[0], device=self.device, dtype=torch.bool)
+                index_unmask[index_mask] = False
+                unmask_loss = F.cross_entropy(valid_seq_score[index_unmask], target[index_unmask], reduction='sum', ignore_index=self.ignore_index)
+
+                clustering_loss += self.loss_weight * mask_loss + (1-self.loss_weight) * unmask_loss
+            # average across batch
+            total_loss += clustering_loss / scores.shape[0]
+
+        return total_loss
 
     def training_step(self, batch, batch_index):
         inputs, wave_lens, targets = batch['waves'], batch['lens'], batch['targets']
         # inputs.shape = [batch, max_wave_len]
         # targets.shape = [batch, n_frames] ... here n_frames << max_wave_len
 
-        projected_features, wave_lens, batch_mask_indices = self(inputs, wave_lens, inference=False)
+        projected_features, frames_cnt, batch_mask_indices = self(inputs, wave_lens, inference=False)
         # projected_features.shape = [batch, n_frames, proj_dim]
+        similarity_scores = self._compute_cos_sim(projected_features)
 
-        loss = self._loss(projected_features, wave_lens, targets, batch_mask_indices)
+        loss = self._compute_loss(similarity_scores, frames_cnt, targets, batch_mask_indices)
         return loss
 
 
@@ -112,76 +139,26 @@ if __name__ == '__main__':
         torch.concat([torch.rand(16000 * 4), torch.zeros(16000)])
     ])
     # inputs.shape = [batch=2, n_samples]
-    features_batch, lengths_batch = hubert_base_model.feature_extractor(inputs, torch.tensor([16000 * 5, 16000 * 4]))
 
-    features_np = features_batch.detach().numpy()
-    lengths_np = lengths_batch.detach().numpy()
-
-    # %%
-
-    # %%
-    batch = torch.arange(112).view(2, 4, 14)
-    lengths = torch.tensor([
-        [13, 10, 5, 10],
-        [13, 5, 10, 10],
+    ignore_index = -1
+    targets = torch.stack([
+        torch.stack([
+            torch.randint(0, 5, size=(250,)),
+            F.pad(torch.randint(0, 5, size=(200,)), (50, 0), value=ignore_index)
+        ]),
+        torch.stack([
+            torch.randint(0, 10, size=(250,)),
+            F.pad(torch.randint(0, 10, size=(200,)), (50, 0), value=ignore_index)
+        ])
     ])
-    ic(batch, batch.shape)
-    ic(lengths, lengths.shape)
 
-    index = torch.tensor([
-        [[0, 1],
-         [1, 2]],
+    batch = dict(
+        waves=inputs,
+        lens=torch.tensor([16000 * 5, 16000 * 4]),
+        targets=targets,
+    )
 
-        [[0, 5],
-         [1, 4]]
-    ])
-    ic(index)
-    torch.gather(batch, dim=2, index=lengths.unsqueeze(-1))
+    hubert_pretrain = HubertPretrainPL(hubert_base_model, [5, 10], 256, 0.5, ignore_index=ignore_index)
 
-    # how to use torch.gather
-    #
-    # if dim == 0  ::  result_{i,j,k} = input_{index_{i,j,k}, j,              k}
-    # if dim == 1  ::  result_{i,j,k} = input_{j,             index_{i,j,k},  k}
-    # if dim == 2  ::  result_{i,j,k} = input_{i,             j,              index_{i,j,k}}
-    #
-    # indices_for_index = torch.tensor([
-    #         [[{0,0,0}, {0,0,1}],
-    #          [{0,1,0}, {0,1,1}]],
-    #
-    #         [[{1,0,0}, {1,0,1}],
-    #          [{1,1,0}, {1,1,1}]]
-    #     ])
-    # docs:
-    #   * https://pytorch.org/docs/stable/generated/torch.gather.html
-    #   * https://stackoverflow.com/a/54706716
-    # %%
-    # MASK BY LENGTH
-    # will use broadcasting
-    # index each row
-    batch_row_indices = torch.arange(batch.shape[-1])
-    # batch_row_indices = torch.arange(batch.shape[-1]).repeat(batch.shape[0] * batch.shape[1]).view(*batch.shape)
-    # mask by length
-    # shapes ::
-    #   batch_row_indices.shape = [14]
-    #   lengths.unsqueeze(-1).shape = [2, 4, 1]
-    lengths_mask = batch_row_indices < lengths.unsqueeze(-1)
-    # [2, 4, 14]
-    lengths_mask
-    # masked_batch = batch * lengths_mask
-    # masked_batch
+    l = hubert_pretrain.training_step(batch, 1)
 
-    # %%
-    x = torch.arange(12).reshape(3, 4) * 100
-    ic(x)
-    indices = torch.tensor([0, 2])
-    ic(indices)
-    ic(torch.index_select(x, 0, indices))
-    ic(torch.index_select(x, 1, indices))
-    # %%
-    p = 0.3
-    pop_size = 14
-    device = 'cpu'
-    num_samples = int(pop_size * p)
-    # %%
-
-    pass
