@@ -7,10 +7,27 @@ from pytorch_lightning.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADER
 from torch import nn
 from collections import OrderedDict
 import torch.nn.functional as F
+from torchmetrics.functional import accuracy
+from torch import optim
+
 
 
 class HubertPretrainPL(pl.LightningModule):
-    def __init__(self, hubert_model, cluster_sizes, proj_dim, loss_weight, hubert_features=768, p=0.08, l=10, ignore_index=-1):
+    def __init__(self,
+                 hubert_model,
+                 cluster_sizes,
+                 proj_dim,
+                 mask_weight,
+                 softmax_temp,
+                 betas,
+                 warm_up_steps,
+                 total_steps,
+                 hubert_features=768,
+                 peak_lr=5e-4,
+                 p=0.08,
+                 l=10,
+                 ignore_index=-1
+                 ):
         super().__init__()
         # can access Conv feature extractor using hubert_base_model.feature_extractor and BERT using hubert_base_model.encoder
         # extractor takes audios and lengths and returns features and new lengths
@@ -18,12 +35,22 @@ class HubertPretrainPL(pl.LightningModule):
         # https://github.com/pytorch/audio/tree/main/torchaudio/models/wav2vec2
         self.hubert_model = hubert_model
         self.ignore_index = ignore_index
+
         self.p = p
         self.l = l
+
+        self.betas = betas
+        self.warm_up_steps = warm_up_steps
+        self.lr_inc = peak_lr / warm_up_steps
+        self.lr_dec = peak_lr / (total_steps - warm_up_steps)
+
         self.mask = 0
-        self.loss_weight = loss_weight
-        self.cluster_sizes = cluster_sizes
+        self.mask_loss_weight = mask_weight
+
+        self.softmax_temp = softmax_temp
+
         self.proj_dim = proj_dim
+        self.cluster_sizes = cluster_sizes
         self.proj_layer = nn.Linear(in_features=hubert_features, out_features=proj_dim)
         self.cluster_proj_layers = nn.ModuleDict(
             OrderedDict(
@@ -74,11 +101,11 @@ class HubertPretrainPL(pl.LightningModule):
                 projected_features[:, :, None, :],  # [batch, n_frames, 1, proj_dim]
                 embedded_target[None, None, :, :],  # [1,     1,        k, proj_dim]
                 dim=-1  # common dimension
-            )
+            ) * self.softmax_temp
             # similarity_scores[k].shape = [batch, n_frames, k]
         return similarity_scores
 
-    def _compute_loss(self, similarity_scores, frames_cnt, targets, batch_mask_indices):
+    def _compute_loss_acc(self, similarity_scores, frames_cnt, targets, batch_mask_indices):
         # targets.shape = [n_clusterings, batch, n_frames]
         # n_frames.shape = [batch, ]
         # batch_mask_indices is a list, batch_mask_indices[i] = torch tensor with indices where span mask was applied
@@ -86,11 +113,14 @@ class HubertPretrainPL(pl.LightningModule):
         # cross_entropy recap
         #   The input is expected to contain raw, unnormalized scores for each class.
         #   input has to be a Tensor of size either (minibatch, C).
-        total_loss = 0
+        total_mask_loss, total_unmask_loss = 0, 0
+        total_mask_acc, total_unmask_acc = 0, 0
         # iterate over different clustering models
         for (k, scores), k_target in zip(similarity_scores.items(), targets):
             # scores.shape = [batch, n_frames, k]
-            clustering_loss = 0
+            clustering_mask_loss, clustering_unmask_loss = 0, 0
+            clustering_mask_acc, clustering_unmask_acc = 0, 0
+
             # iterate over sequences in the batch
             for seq_score, target, seq_len, index_mask in zip(scores, k_target, frames_cnt, batch_mask_indices):
                 # seq_score.shape = [n_frames, k]
@@ -102,30 +132,60 @@ class HubertPretrainPL(pl.LightningModule):
                 target = target[:seq_len]
                 # valid_seq_score.shape = [seq_len, k]
                 # cross entropy loss over masked frames
-                mask_loss = F.cross_entropy(valid_seq_score[index_mask], target[index_mask], reduction='sum', ignore_index=self.ignore_index)
+                ic(k)
+                ic(target)
+                mask_loss = F.cross_entropy(valid_seq_score[index_mask], target[index_mask], reduction='sum')
+                mask_acc = accuracy(valid_seq_score[index_mask], target[index_mask], )
+                clustering_mask_loss += mask_loss
+                clustering_mask_acc += mask_acc
 
                 # cross entropy loss over frames without mask
                 index_unmask = torch.ones(valid_seq_score.shape[0], device=self.device, dtype=torch.bool)
                 index_unmask[index_mask] = False
-                unmask_loss = F.cross_entropy(valid_seq_score[index_unmask], target[index_unmask], reduction='sum', ignore_index=self.ignore_index)
-
-                clustering_loss += self.loss_weight * mask_loss + (1-self.loss_weight) * unmask_loss
+                unmask_loss = F.cross_entropy(valid_seq_score[index_unmask], target[index_unmask], reduction='sum')
+                unmask_acc = accuracy(valid_seq_score[index_unmask], target[index_unmask], )
+                clustering_unmask_acc += unmask_acc
+                clustering_unmask_loss += unmask_loss
             # average across batch
-            total_loss += clustering_loss / scores.shape[0]
+            total_mask_loss += clustering_mask_loss / scores.shape[0]
+            total_unmask_loss += clustering_unmask_loss / scores.shape[0]
 
-        return total_loss
+            total_mask_acc += clustering_mask_acc / scores.shape[0]
+            total_unmask_acc += clustering_unmask_acc / scores.shape[0]
 
-    def training_step(self, batch, batch_index):
+        return total_mask_loss, total_unmask_loss, total_mask_acc, total_unmask_acc
+
+    def training_step(self, batch, batch_index, inference=False):
         inputs, wave_lens, targets = batch['waves'], batch['lens'], batch['targets']
         # inputs.shape = [batch, max_wave_len]
         # targets.shape = [batch, n_frames] ... here n_frames << max_wave_len
 
-        projected_features, frames_cnt, batch_mask_indices = self(inputs, wave_lens, inference=False)
+        projected_features, frames_cnt, batch_mask_indices = self(inputs, wave_lens, inference=inference)
         # projected_features.shape = [batch, n_frames, proj_dim]
         similarity_scores = self._compute_cos_sim(projected_features)
 
-        loss = self._compute_loss(similarity_scores, frames_cnt, targets, batch_mask_indices)
-        return loss
+        mask_loss, unmask_loss, mask_acc, unmask_acc = self._compute_loss_acc(similarity_scores, frames_cnt, targets, batch_mask_indices)
+        total_loss = self.mask_loss_weight * mask_loss + (1 - self.mask_loss_weight) * unmask_loss
+        return dict(loss=total_loss, mask_loss=mask_loss, unmask_loss=unmask_loss, mask_acc=mask_acc, unmask_acc=unmask_acc, batch_size=inputs.shape[0])
+
+    def validation_step(self, batch, batch_index):
+        return self.training_step(batch, batch_index, inference=True)
+
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.parameters(), lr=0, betas=self.betas)
+        return dict(optimizer=optimizer)
+
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx=0, optimizer_closure=None, on_tpu=False, using_native_amp=False, using_lbfgs=False):
+        if self.trainer.global_step < self.warm_up_steps:
+            lr_scale = self.lr_inc
+        else:
+            lr_scale = - self.lr_dec
+
+        for pg in optimizer.param_groups:
+            pg['lr'] += lr_scale
+
+        optimizer.step(closure=optimizer_closure)
+
 
 
 # %%
@@ -144,11 +204,11 @@ if __name__ == '__main__':
     targets = torch.stack([
         torch.stack([
             torch.randint(0, 5, size=(250,)),
-            F.pad(torch.randint(0, 5, size=(200,)), (50, 0), value=ignore_index)
+            F.pad(torch.randint(0, 5, size=(200,)), (0, 50), value=ignore_index)
         ]),
         torch.stack([
             torch.randint(0, 10, size=(250,)),
-            F.pad(torch.randint(0, 10, size=(200,)), (50, 0), value=ignore_index)
+            F.pad(torch.randint(0, 10, size=(200,)), (0, 50), value=ignore_index)
         ])
     ])
 
@@ -158,7 +218,25 @@ if __name__ == '__main__':
         targets=targets,
     )
 
-    hubert_pretrain = HubertPretrainPL(hubert_base_model, [5, 10], 256, 0.5, ignore_index=ignore_index)
+    hubert_pretrain = HubertPretrainPL(
+        hubert_base_model,
+        cluster_sizes=[5, 10],
+        proj_dim=256,
+        mask_weight=0.5,
+        softmax_temp=0.1,
+        betas=(0.9, 0.98),
+        warm_up_steps=100,
+        total_steps=500,
+        hubert_features=768,
+        peak_lr=5e-4,
+        p=0.08,
+        l=10,
+        ignore_index=ignore_index
+    )
 
     l = hubert_pretrain.training_step(batch, 1)
 
+    # %%
+    x = torch.arange(4 * 5*3).view(4, 5, 3)
+    lens = torch.tensor([5, 4, 3, 2])
+    new_lens = []
