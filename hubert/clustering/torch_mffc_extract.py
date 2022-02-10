@@ -14,6 +14,10 @@ from pytorch_lightning.profiler import PyTorchProfiler
 from pytorch_lightning.loggers import TensorBoardLogger
 import shutil
 from icecream import ic
+from typing import Optional
+import traceback
+import sys
+
 
 class ParCzechDataset(Dataset):
     def __init__(self, df_path, resample_rate=16000, clean_params=None):
@@ -26,6 +30,7 @@ class ParCzechDataset(Dataset):
 
     def clean_data(self, df, params):
         # thresholds were selected based on the plot
+        df = df[(df.type == 'train') | (df.type == 'other')]
         df = df[df.recognized_sound_coverage__segments > params['recognized_sound_coverage__segments_lb']]
         df = df[df.recognized_sound_coverage__segments < params['recognized_sound_coverage__segments_ub']]
         # removed 404.5 hours
@@ -36,7 +41,11 @@ class ParCzechDataset(Dataset):
     def extract_path(self, i):
         row = self.df.iloc[i]
         # need to remove prefix  'sentences_'
-        mp3_name = row.mp3_name.split('_')[-1]
+        try:
+            mp3_name = row.mp3_name.split('_')[-1]
+        except:
+            ic(row)
+
         return os.path.join(row.segment_path, mp3_name)
 
     def get_gold_transcript(self, path):
@@ -134,7 +143,7 @@ class MFCCExtractorPL(pl.LightningModule):
 
 
 class SaveResultsCB(pl.Callback):
-    def __init__(self, target_path, n_fft, buffer_size, df_type, resample_rate=16000, frame_length=20):
+    def __init__(self, target_path, n_fft, buffer_size, df_type, total_batches, resample_rate=16000, frame_length=20):
         self.df_type = df_type
         self.output_dir = target_path
         self.n_fft = n_fft
@@ -148,17 +157,19 @@ class SaveResultsCB(pl.Callback):
         self.cnt = 0
         self.resample_rate = resample_rate
         self. total_duration_sec = 0
+        self.loggers = {}
+        self.total_batches = total_batches
 
     def extract_name(self, path):
         if self.df_type == 'common_voice':
             return path
         elif self.df_type == 'parczech':
-            return os.path.join(path.split('/')[-2:])
+            return '/'.join(path.split('/')[-2:])
         else:
             raise NotImplementedError(f'{self.df_type} is not supported')
 
     def write_df(self, trainer):
-        output_path = os.path.join(self.output_dir, f'{trainer.global_rank:02}-{self.cnt:03}.csv')
+        output_path = os.path.join(self.output_dir, f'{trainer.global_rank:02}-{self.cnt:04}.csv')
         result = pd.concat(self.dataframes).reset_index()
         result['path'] = result['path'] + '/' + result['index'].astype(str)
         result.drop('index', axis=1).to_csv(output_path, index=False)
@@ -185,10 +196,33 @@ class SaveResultsCB(pl.Callback):
             if self.current_buffer >= self.buffer_size:
                 self.write_df(trainer)
 
+        if batch_idx % 50 == 0:
+            logger = self.loggers[pl_module.global_rank]
+            logger.debug(f'gpu={pl_module.global_rank:2} batches processed {batch_idx:4}/{self.total_batches} ... {batch_idx/self.total_batches:.4f}')
+
+    def setup(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", stage: Optional[str] = None) -> None:
+        # setup loggers for each gpu
+        # logging.basicConfig(filename=logging_file, filemode='a', level=logging.DEBUG, format='%(asctime)s - %(message)s', datefmt='%H:%M:%S %d.%m.%Y')
+        handler = logging.FileHandler(f'gpu-{pl_module.global_rank}.log')
+        formatter = logging.Formatter(fmt='%(asctime)s - %(message)s', datefmt='%H:%M:%S %d.%m.%Y')
+        handler.setFormatter(formatter)
+
+        logger = logging.getLogger(f'{pl_module.global_rank}')
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(handler)
+        self.loggers[pl_module.global_rank] = logger
+
     def on_predict_epoch_end(self, trainer, pl_module, outputs):
-        print(f'{self.total_duration_sec // 60}::{self.total_duration_sec % 60:.2f}')
         if self.dataframes != []:
             self.write_df(trainer)
+
+        logger = self.loggers[pl_module.global_rank]
+        total_duration_hours = int(self.total_duration_sec // 3600)
+        remaining_seconds = int(self.total_duration_sec % 3600)
+        total_duration_mins = int(remaining_seconds // 60)
+        total_duration_secs = int(remaining_seconds % 60)
+        logger.debug(f'gpu={pl_module.global_rank:2} finished, {total_duration_hours:3}:{total_duration_mins:2}:{total_duration_secs:.3f} or'
+                     f' {self.total_duration_sec:.3f} seconds')
 
 
 def compute_frames(wave_len, n_fft, frame_length, sample_rate):
@@ -232,44 +266,50 @@ def plot_spectrogram(spec, title=None, ylabel='freq_bin', aspect='auto', xmax=No
 # %%
 if __name__ == '__main__':
     # %%
-
-    # logging_file = '/lnet/express/work/people/stankov/alignment/Thesis/mfcc.log'
-    parczech_df_path = '/lnet/express/work/people/stankov/alignment/Thesis/clean_with_path.csv'
-
-    # under base dir there are tsv file and clips/ folder
-    common_voice_base_dir = '/root/common_voice_data/cv-corpus-7.0-2021-07-21/cs'
-
-    # directory where mfccs will be stored
-    output_dir = os.path.join(common_voice_base_dir, 'mffcs')
-
     # logging.basicConfig(filename=logging_file, filemode='a', level=logging.DEBUG, format='%(asctime)s - %(message)s', datefmt='%H:%M:%S %d.%m.%Y')
-
     params = dict(
         resample_rate=16000,
         batch_size=60,
         n_mffcs=13,
         n_mels=40,
         n_fft=640,
-        buffer_size=50000,
-        df_type='common_voice',
+        buffer_size=100000,
+        df_type='parczech',
         frame_length_ms=20,
         data_type='validated'
     )
-
     parczech_clean_params = dict(
         recognized_sound_coverage__segments_lb=0.45,
         recognized_sound_coverage__segments_ub=0.93,
         duration__segments_lb=0.5,
     )
-    # dataset = ParCzechDataset(parczech_df_path, resample_rate=params['resample_rate'], clean_params=parczech_clean_params)
-    dataset = CommonVoiceDataset(common_voice_base_dir, params['data_type'], params['resample_rate'])
+
+    if 'lnet' in os.getcwd():
+        df_path = '/lnet/express/work/people/stankov/alignment/Thesis/clean_with_path_large.csv'
+        # df = pd.read_csv(df_path, sep='\t')
+        # directory where mfccs will be stored
+        output_dir = '/lnet/express/work/people/stankov/alignment/mfcc'
+        dataset = ParCzechDataset(df_path, resample_rate=params['resample_rate'], clean_params=parczech_clean_params)
+    else:
+        # under base dir there are tsv file and clips/ folder
+        base_dir = '/root/common_voice_data/cv-corpus-7.0-2021-07-21/cs'
+        # directory where mfccs will be stored
+        output_dir = os.path.join(base_dir, 'mffcs')
+        dataset = CommonVoiceDataset(base_dir, params['data_type'], params['resample_rate'])
+
+
+    # %%
     dataloader = DataLoader(dataset, batch_size=params['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=os.cpu_count() // 4, pin_memory=True)
     extractor = MFCCExtractorPL(n_mffcs=params['n_mffcs'], n_mels=params['n_mels'], n_fft=params['n_fft'], f_max=params['resample_rate']// 2,
                                 output_dir=output_dir, resample_rate=params['resample_rate'])
 
 
-    cb = SaveResultsCB(output_dir, params['n_fft'], buffer_size=params['buffer_size'], df_type=params['df_type'], frame_length=params['frame_length_ms'], )
-    trainer = pl.Trainer(gpus=-1, strategy='ddp', num_sanity_val_steps=0, callbacks=cb, precision=16, deterministic=True)
+    cb = SaveResultsCB(output_dir, params['n_fft'], buffer_size=params['buffer_size'], df_type=params['df_type'], frame_length=params['frame_length_ms'],
+                       total_batches=len(dataloader))
+
+    trainer = pl.Trainer(gpus=-1, strategy='ddp', num_sanity_val_steps=0, callbacks=cb, deterministic=True, progress_bar_refresh_rate=0)
     # trainer = pl.Trainer(gpus=1, num_sanity_val_steps=0, callbacks=cb, precision=16, deterministic=True, limit_predict_batches=10)
     trainer.predict(extractor, dataloader)
+
+    ic('done')
 

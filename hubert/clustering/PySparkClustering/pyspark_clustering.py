@@ -9,7 +9,7 @@ def do_my_logging(log_msg):
     # logger = logging.getLogger('__FILE__')
     print('log_msg = {}'.format(log_msg))
     
-merged_dir = '/lnet/express/work/people/stankov/alignment/mfccs/merged'
+merged_dir = '/lnet/express/work/people/stankov/alignment/mfcc'
 # logging.basicConfig(filename=f"pyspark_example.log", filemode='w', level=logging.DEBUG, format='[%(levelname)s] %(asctime)s - %(message)s', datefmt='%H:%M:%S '
 #                                                                                                                                               '%d.%m.%Y')
 spark = SparkSession.builder.appName('name').getOrCreate()
@@ -20,7 +20,6 @@ do_my_logging('Session started')
 dataset = None
 do_my_logging('Iterating over merged dir')
 for i, csv_file in enumerate(os.listdir(merged_dir)):
-
     if not csv_file.endswith('.csv'):
         continue
 
@@ -43,8 +42,9 @@ assembler = VectorAssembler(inputCols=[f'{i}' for i in range(39)], outputCol='fe
 final_data = assembler.transform(dataset)
 
 new_data = None
-# clusters = [2, 5]
-clusters = [2, 5, 10, 25, 50, 100, 250, 500]
+clusters = [2, 5, 10, 15, 20, 25, 50, 75, 100, 200, 250, 300, 400, 500, 1000]
+do_my_logging(f'clusters are {clusters}')
+
 for k in clusters:
     do_my_logging(f'Kmeans with k={k}')
     kmeans = KMeans(featuresCol='features', k=k, initSteps=5, seed=0xDEAD)
@@ -57,8 +57,9 @@ for k in clusters:
 
     new_data = new_data.withColumnRenamed('prediction', f'km{k}')
 
-    do_my_logging(f'new columns{new_data.columns}')
     do_my_logging(f'wssse {km_model.computeCost(final_data):.3f}')
+
+do_my_logging(f'new columns{new_data.columns}')
 
 do_my_logging('finished clustering for all k')
 #
@@ -67,4 +68,5 @@ do_my_logging('finished clustering for all k')
 do_my_logging('saving the results')
 output_dir = os.path.join(merged_dir, 'clustering')
 new_data.select([f'km{k}' for k in clusters] + ['path']).write.csv(output_dir, header=True, mode='overwrite')
+do_my_logging('done, exiting')
 

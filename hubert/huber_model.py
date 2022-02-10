@@ -11,7 +11,6 @@ from torchmetrics.functional import accuracy
 from torch import optim
 
 
-
 class HubertPretrainPL(pl.LightningModule):
     def __init__(self,
                  hubert_model,
@@ -132,8 +131,6 @@ class HubertPretrainPL(pl.LightningModule):
                 target = target[:seq_len]
                 # valid_seq_score.shape = [seq_len, k]
                 # cross entropy loss over masked frames
-                ic(k)
-                ic(target)
                 mask_loss = F.cross_entropy(valid_seq_score[index_mask], target[index_mask], reduction='sum')
                 mask_acc = accuracy(valid_seq_score[index_mask], target[index_mask], )
                 clustering_mask_loss += mask_loss
@@ -236,7 +233,3 @@ if __name__ == '__main__':
 
     l = hubert_pretrain.training_step(batch, 1)
 
-    # %%
-    x = torch.arange(4 * 5*3).view(4, 5, 3)
-    lens = torch.tensor([5, 4, 3, 2])
-    new_lens = []

@@ -35,5 +35,5 @@ splitted_df['segment_path'] = segment_base_dir + splitted_df.type.map(rename) + 
 
 # %%
 df = splitted_df.drop(columns=['path', 'name'])
-df.to_csv(os.path.join(base_dir, 'Thesis', 'clean_with_path.csv'), sep='\t', index=False)
+df.to_csv(os.path.join(base_dir, 'Thesis', 'clean_with_path_large.csv'), sep='\t', index=False)
 # df = pd.read_csv(os.path.join(base_dir, 'clean_with_path.csv'), sep='\t')
