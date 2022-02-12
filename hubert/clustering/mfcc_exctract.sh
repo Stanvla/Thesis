@@ -20,14 +20,14 @@
 # If you need more than one GPU card (on a single machine), always require at least as many CPU cores (-pe smp X) as many GPU cards you need.
 
 
-#$ -l gpu=8,gpu_ram=10G
+#$ -l gpu=6,gpu_ram=13G
 # ............................................................................................
 
 
 # number of CPUs
 # If you need more than one GPU card (on a single machine), always require at least as many CPU cores (-pe smp X) as many GPU cards you need.
 
-#$ -pe smp 16
+#$ -pe smp 24
 # ............................................................................................
 
 

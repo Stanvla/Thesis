@@ -1,22 +1,17 @@
 # %%
 import logging
 import os.path
+import shutil
+from typing import Optional
 
 import matplotlib.pyplot as plt
-import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 import torchaudio
-from torch.utils.data import Dataset, DataLoader
-from pytorch_lightning.profiler import PyTorchProfiler
-from pytorch_lightning.loggers import TensorBoardLogger
-import shutil
 from icecream import ic
-from typing import Optional
-import traceback
-import sys
+from torch.utils.data import Dataset, DataLoader
 
 
 class ParCzechDataset(Dataset):
@@ -111,6 +106,8 @@ class MFCCExtractorPL(pl.LightningModule):
         super(MFCCExtractorPL, self).__init__()
         self.output_dir = output_dir
         self.n_fft = n_fft
+        self.sr = resample_rate
+
         self.MFCC_transform = torchaudio.transforms.MFCC(
             resample_rate,
             n_mfcc=n_mffcs,
@@ -129,7 +126,7 @@ class MFCCExtractorPL(pl.LightningModule):
         os.makedirs(self.output_dir)
 
     def forward(self, batch):
-        wavs = batch[0]
+        wavs, _, lens = batch
 
         mfccs_batch = self.MFCC_transform(wavs)
         deltas_batch = self.delta_transform(mfccs_batch)
@@ -139,7 +136,15 @@ class MFCCExtractorPL(pl.LightningModule):
         # stacking features
         output = torch.cat([mfccs_batch, deltas_batch, deltas2_batch], dim=2).squeeze().permute(0, 2, 1)
         # [batch_size, max_n_frames, 13 * 3]
-        return output
+        n_frames = torch.tensor([compute_frames(l, self.sr) for l in lens], device=self.device)
+        return output, n_frames
+
+
+def compute_frames(wave_len, sample_rate):
+    ms_int = int(wave_len / sample_rate * 1000)
+    # these "random" operations mimic how hubert.feature extractor counts frames in the audio
+    new_ms = (ms_int - (ms_int % 5) - 1) // 20
+    return new_ms
 
 
 class SaveResultsCB(pl.Callback):
@@ -156,7 +161,7 @@ class SaveResultsCB(pl.Callback):
         # count how many df written to disk
         self.cnt = 0
         self.resample_rate = resample_rate
-        self. total_duration_sec = 0
+        self.total_duration_sec = 0
         self.loggers = {}
         self.total_batches = total_batches
 
@@ -179,18 +184,18 @@ class SaveResultsCB(pl.Callback):
         self.cnt += 1
 
     def on_predict_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
-        _, paths, lengths = batch
-        outputs = outputs.cpu().numpy()
-        for wav_len, features, path in zip(lengths, outputs, paths):
-            n_frames, new_wav_len = compute_frames(wav_len, self.n_fft, self.frame_length, self.resample_rate)
+        _, paths, wave_lens = batch
+        self.total_duration_sec += sum(w_len / self.resample_rate for w_len in wave_lens)
+
+        mfcc_features, frames_cnt = outputs[0].cpu().numpy(), outputs[1].cpu().numpy()
+        for n_frames, features, path in zip(frames_cnt, mfcc_features, paths):
             self.current_buffer += n_frames
 
             # select only useful frames without padding
-            features = features[:n_frames + 1]
+            features = features[:n_frames]
 
             features_df = pd.DataFrame(data=features)
             features_df['path'] = self.extract_name(path)
-            self.total_duration_sec += new_wav_len/self.resample_rate
             self.dataframes.append(features_df)
 
             if self.current_buffer >= self.buffer_size:
@@ -198,7 +203,7 @@ class SaveResultsCB(pl.Callback):
 
         if batch_idx % 50 == 0:
             logger = self.loggers[pl_module.global_rank]
-            logger.debug(f'gpu={pl_module.global_rank:2} batches processed {batch_idx:4}/{self.total_batches} ... {batch_idx/self.total_batches:.4f}')
+            logger.debug(f'gpu={pl_module.global_rank:2} batches processed {batch_idx:4}/{self.total_batches} ... {batch_idx / self.total_batches:.4f}')
 
     def setup(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule", stage: Optional[str] = None) -> None:
         # setup loggers for each gpu
@@ -223,16 +228,6 @@ class SaveResultsCB(pl.Callback):
         total_duration_secs = int(remaining_seconds % 60)
         logger.debug(f'gpu={pl_module.global_rank:2} finished, {total_duration_hours:3}:{total_duration_mins:2}:{total_duration_secs:.3f} or'
                      f' {self.total_duration_sec:.3f} seconds')
-
-
-def compute_frames(wave_len, n_fft, frame_length, sample_rate):
-    if wave_len % frame_length == 0:
-        return 2 * wave_len // n_fft, wave_len
-    else:
-        # modification if wave length is not divisible by frame length, I would slightly increase wave length (adding one more frame)
-        frames = (2 * wave_len // n_fft) + 1
-        duration_sec = frames * frame_length / 1000
-        return frames, duration_sec * sample_rate
 
 
 def collate_fn(batch):
@@ -269,11 +264,11 @@ if __name__ == '__main__':
     # logging.basicConfig(filename=logging_file, filemode='a', level=logging.DEBUG, format='%(asctime)s - %(message)s', datefmt='%H:%M:%S %d.%m.%Y')
     params = dict(
         resample_rate=16000,
-        batch_size=60,
+        batch_size=70,
         n_mffcs=13,
         n_mels=40,
         n_fft=640,
-        buffer_size=100000,
+        buffer_size=130000,
         df_type='parczech',
         frame_length_ms=20,
         data_type='validated'
@@ -297,12 +292,10 @@ if __name__ == '__main__':
         output_dir = os.path.join(base_dir, 'mffcs')
         dataset = CommonVoiceDataset(base_dir, params['data_type'], params['resample_rate'])
 
-
     # %%
     dataloader = DataLoader(dataset, batch_size=params['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=os.cpu_count() // 4, pin_memory=True)
-    extractor = MFCCExtractorPL(n_mffcs=params['n_mffcs'], n_mels=params['n_mels'], n_fft=params['n_fft'], f_max=params['resample_rate']// 2,
+    extractor = MFCCExtractorPL(n_mffcs=params['n_mffcs'], n_mels=params['n_mels'], n_fft=params['n_fft'], f_max=params['resample_rate'] // 2,
                                 output_dir=output_dir, resample_rate=params['resample_rate'])
-
 
     cb = SaveResultsCB(output_dir, params['n_fft'], buffer_size=params['buffer_size'], df_type=params['df_type'], frame_length=params['frame_length_ms'],
                        total_batches=len(dataloader))
@@ -312,4 +305,3 @@ if __name__ == '__main__':
     trainer.predict(extractor, dataloader)
 
     ic('done')
-

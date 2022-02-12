@@ -9,6 +9,7 @@ from collections import OrderedDict
 import torch.nn.functional as F
 from torchmetrics.functional import accuracy
 from torch import optim
+from hubert.clustering.torch_mffc_extract import compute_frames
 
 
 class HubertPretrainPL(pl.LightningModule):
@@ -75,7 +76,7 @@ class HubertPretrainPL(pl.LightningModule):
         return torch.stack(masked_batch), batch_mask_indices
 
     def forward(self, inputs, wave_lens, inference=True):
-        features_batch, frames_cnt = hubert_base_model.feature_extractor(inputs, wave_lens)
+        features_batch, frames_cnt = self.hubert_model.feature_extractor(inputs, wave_lens)
         batch_mask_indices = None
         if not inference:
             features_batch, batch_mask_indices = self._mask_span(features_batch, frames_cnt)
@@ -159,6 +160,7 @@ class HubertPretrainPL(pl.LightningModule):
 
         projected_features, frames_cnt, batch_mask_indices = self(inputs, wave_lens, inference=inference)
         # projected_features.shape = [batch, n_frames, proj_dim]
+        ic(frames_cnt)
         similarity_scores = self._compute_cos_sim(projected_features)
 
         mask_loss, unmask_loss, mask_acc, unmask_acc = self._compute_loss_acc(similarity_scores, frames_cnt, targets, batch_mask_indices)
@@ -184,12 +186,54 @@ class HubertPretrainPL(pl.LightningModule):
         optimizer.step(closure=optimizer_closure)
 
 
+def gen_wav_targ(wav_sec, classes, sr, frame_len):
+    samples = int(sr * wav_sec)
+    n_frames = int(wav_sec // frame_len)
+    return dict(
+        wave=torch.rand(samples),
+        target=torch.randint(classes, size=(n_frames, ))
+    )
+
+
+def pad_list(tensor_list):
+    lens = [t.shape[0] for t in tensor_list]
+    max_len = max(lens)
+    result = torch.stack([
+        F.pad(t, (0, max_len - t.shape[0])) for t in tensor_list
+    ])
+    return result, torch.tensor(lens)
+
+
+def collate_fn(wavs_targets, nfft, frame_len, sr):
+    wavs = [x['wave'] for x in wavs_targets]
+    targets = [x['target'] for x in wavs_targets]
+
+    padded_waves, wav_lens = pad_list(wavs)
+    padded_targets, _ = pad_list(targets)
+    return dict(
+        waves=padded_waves,
+        lens=wav_lens,
+        targets=padded_targets,
+        n_frames=[compute_frames(l.item(), sr) for l in wav_lens]
+    )
 
 # %%
 if __name__ == '__main__':
     # %%
     # aux_num_out ... when provided, attach an extra linear layer on top of encoder, which can be used for fine-tuning.
     hubert_base_model = torchaudio.models.hubert_base()
+    secs = torch.rand(150) + 1.5
+    secs = [s.item() for s in secs] + [2, 2.05, 2.11, 2.01, 2.2]
+    batch = collate_fn([gen_wav_targ(s, 10, 16000, 0.02) for s in secs], nfft=640, sr=16000, frame_len=0.02)
+
+    features_batch, frames_cnt = hubert_base_model.feature_extractor(batch['waves'], batch['lens'])
+    total_dif = 0
+    for my, ref, l, features in zip(batch['n_frames'], frames_cnt, secs, features_batch):
+        total_dif += ref.item() - my
+        print(f'ms={l:.4f}, my={my:3}, ref={ref.item():3}, diff={ref.item() - my:2}')
+
+    print(total_dif)
+    # %%
 
     inputs = torch.stack([
         torch.rand(16000 * 5),
