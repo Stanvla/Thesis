@@ -18,20 +18,10 @@ class ParCzechDataset(Dataset):
     def __init__(self, df_path, resample_rate=16000, clean_params=None):
         super(ParCzechDataset, self).__init__()
         df = pd.read_csv(df_path, sep='\t')
-        df = self.clean_data(df, clean_params)
+        df = clean_data(df, clean_params)
         self.df = df.sort_values(by=['duration__segments'], ascending=False).copy().reset_index(drop=True)
         self.new_sr = resample_rate
         self.resample_transform = None
-
-    def clean_data(self, df, params):
-        # thresholds were selected based on the plot
-        df = df[(df.type == 'train') | (df.type == 'other')]
-        df = df[df.recognized_sound_coverage__segments > params['recognized_sound_coverage__segments_lb']]
-        df = df[df.recognized_sound_coverage__segments < params['recognized_sound_coverage__segments_ub']]
-        # removed 404.5 hours
-        # use only long enough segments
-        df = df[df.duration__segments > params['duration__segments_lb']]
-        return df
 
     def extract_path(self, i):
         row = self.df.iloc[i]
@@ -75,6 +65,15 @@ class ParCzechDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
+def clean_data(df, params):
+    # thresholds were selected based on the plot
+    df = df[(df.type == 'train') | (df.type == 'other')]
+    df = df[df.recognized_sound_coverage__segments > params['recognized_sound_coverage__segments_lb']]
+    df = df[df.recognized_sound_coverage__segments < params['recognized_sound_coverage__segments_ub']]
+    # removed 404.5 hours
+    # use only long enough segments
+    df = df[df.duration__segments > params['duration__segments_lb']]
+    return df
 
 class CommonVoiceDataset(Dataset):
     def __init__(self, base_dir, type, resample_rate=16000):
