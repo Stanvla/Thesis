@@ -10,7 +10,8 @@ from collections import OrderedDict
 import torch.nn.functional as F
 from torchmetrics.functional import accuracy
 from torch import optim
-from hubert.clustering.torch_mffc_extract import compute_frames, ParCzechDataset
+from clustering.torch_mffc_extract import compute_frames, ParCzechDataset
+from torch.utils.data import DataLoader
 import pandas as pd
 import pickle
 
@@ -44,7 +45,6 @@ class ParCzechPretrain(ParCzechDataset):
             if f.endswith('.csv'):
                 dfs.append(pd.read_csv(os.path.join(self.label_path, folder_path, f)))
         self.current_targ_df = pd.concat(dfs).drop(columns=['mp3'])
-        ic(self.current_targ_df.columns)
         self.current_targ_df['id'] = self.current_targ_df.path.str.split('/').str[-1].astype(int)
 
     def __getitem__(self, i):
@@ -114,6 +114,7 @@ class HubertPretrainPL(pl.LightningModule):
             batch_mask_indices.append(index_mask)
             # create span mask
             mask = torch.ones_like(features, device=self.device)
+            print(mask.shape)
             mask[index_mask, :] = self.mask
             masked_batch.append(features * mask)
         return torch.stack(masked_batch), batch_mask_indices
@@ -204,6 +205,7 @@ class HubertPretrainPL(pl.LightningModule):
         projected_features, frames_cnt, batch_mask_indices = self(inputs, wave_lens, inference=inference)
         # projected_features.shape = [batch, n_frames, proj_dim]
         ic(frames_cnt)
+        ic(targets[0].shape)
         similarity_scores = self._compute_cos_sim(projected_features)
 
         mask_loss, unmask_loss, mask_acc, unmask_acc = self._compute_loss_acc(similarity_scores, frames_cnt, targets, batch_mask_indices)
@@ -239,28 +241,39 @@ def gen_wav_targ(wav_sec, classes, sr, frame_len):
 
 
 def pad_list(tensor_list):
-    lens = [t.shape[0] for t in tensor_list]
+    lens = [t.shape[-1] for t in tensor_list]
     max_len = max(lens)
     result = torch.stack([
-        F.pad(t, (0, max_len - t.shape[0])) for t in tensor_list
+        F.pad(t, (0, max_len - t.shape[-1])) for t in tensor_list
     ])
-    return result, torch.tensor(lens)
+    return result, torch.tensor(lens), max_len
 
+class Collator:
+    def __init__(self, n_classes):
+        self.n_classes = n_classes
 
-def collate_fn(batch):
-    wavs = [x['wave'] for x in batch]
-    targets = [x['target'] for x in batch]
-    padded_waves, wav_lens = pad_list(wavs)
-    padded_targets, _ = pad_list(targets)
-    return dict(
-        waves=padded_waves,
-        lens=wav_lens,
-        targets=padded_targets,
-    )
+    def __call__(self, batch):
+        wavs = [x['wave'] for x in batch]
+        padded_waves, wav_lens, max_len = pad_list(wavs)
+        padded_waves = padded_waves.view(len(batch), max_len)
+        # each target in this list is a list of target_tensors for different k
+        targets = [x['target'] for x in batch]
+        targets_by_k = []
+        for i in range(self.n_classes):
+            lst = [t[i] for t in targets]
+            targets_by_k.append(lst)
+
+        padded_targets = [pad_list(t)[0] for t in targets_by_k]
+        return dict(
+            waves=padded_waves,
+            lens=wav_lens,
+            targets=padded_targets,
+        )
 
 # %%
 if __name__ == '__main__':
     # %%
+    # ............................................... Parameters .......................................................
     df_path = '/lnet/express/work/people/stankov/alignment/subset/subset.csv'
     labels_path = '/lnet/express/work/people/stankov/alignment/clustering_all/segments'
     parczech_clean_params = dict(
@@ -268,7 +281,19 @@ if __name__ == '__main__':
         recognized_sound_coverage__segments_ub=0.93,
         duration__segments_lb=0.5,
     )
+    params = dict(
+        batch_size=2,
+        num_workers=os.cpu_count(),
+        # pin_memory=False,
+        # num_workers=4,
+        pin_memory=False,
+        ignore_index=-1,
+        epochs=5,
+    )
+
     ks = [15, 25, 100]
+
+    # ............................................... Dataset .......................................................
     dataset = ParCzechPretrain(
         df_path=df_path,
         km_labels=ks,
@@ -276,8 +301,42 @@ if __name__ == '__main__':
         label_path=labels_path,
         sep=','
     )
+    collate_fn = Collator(len(ks))
+    dataloader = DataLoader(dataset, batch_size=params['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=os.cpu_count() // 4, pin_memory=True)
 
-    x = dataset[10]
+    # ............................................... Model .......................................................
+    hubert_base_model = torchaudio.models.hubert_base()
+    hubert_pretrain = HubertPretrainPL(
+        hubert_base_model,
+        cluster_sizes=ks,
+        proj_dim=256,
+        mask_weight=0.5,
+        softmax_temp=0.1,
+        betas=(0.9, 0.98),
+        warm_up_steps=100,
+        total_steps=500,
+        hubert_features=768,
+        peak_lr=5e-4,
+        p=0.08,
+        l=10,
+        ignore_index=params['ignore_index']
+    )
+
+    # ............................................... Training .......................................................
+    # trainer = pl.Trainer(gpus=2, strategy='ddp', logger=logger, profiler=profiler, num_sanity_val_steps=0, max_epochs=params['epochs'], callbacks=cb,
+    #                      deterministic=True,
+    #                      precision=16)
+
+    trainer = pl.Trainer(
+        num_sanity_val_steps=0,
+        max_epochs=params['epochs'],
+        deterministic=True,
+        check_val_every_n_epoch=0,
+        fast_dev_run=10,
+        gpus=1,
+    )
+
+    trainer.fit(hubert_pretrain, dataloader)
     # %%
     # aux_num_out ... when provided, attach an extra linear layer on top of encoder, which can be used for fine-tuning.
     hubert_base_model = torchaudio.models.hubert_base()
