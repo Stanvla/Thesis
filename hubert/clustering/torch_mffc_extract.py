@@ -15,11 +15,12 @@ from torch.utils.data import Dataset, DataLoader
 
 
 class ParCzechDataset(Dataset):
-    def __init__(self, df_path, resample_rate=16000, clean_params=None):
+    def __init__(self, df_path, resample_rate=16000, clean_params=None, sep='\t', sort=True, *args, **kwargs):
         super(ParCzechDataset, self).__init__()
-        df = pd.read_csv(df_path, sep='\t')
-        df = clean_data(df, clean_params)
-        self.df = df.sort_values(by=['duration__segments'], ascending=False).copy().reset_index(drop=True)
+        df = pd.read_csv(df_path, sep=sep)
+        self.df = clean_data(df, clean_params)
+        if sort:
+            self.df = self.df.sort_values(by=['duration__segments'], ascending=False).copy().reset_index(drop=True)
         self.new_sr = resample_rate
         self.resample_transform = None
 

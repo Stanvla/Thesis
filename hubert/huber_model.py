@@ -3,14 +3,57 @@ import pytorch_lightning as pl
 import torch
 import torchaudio
 from icecream import ic
+import os
 from pytorch_lightning.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
 from torch import nn
 from collections import OrderedDict
 import torch.nn.functional as F
 from torchmetrics.functional import accuracy
 from torch import optim
-from hubert.clustering.torch_mffc_extract import compute_frames
+from hubert.clustering.torch_mffc_extract import compute_frames, ParCzechDataset
+import pandas as pd
+import pickle
 
+
+class ParCzechPretrain(ParCzechDataset):
+    def __init__(self, df_path, km_labels, resample_rate=16000, clean_params=None, label_path=None, sep='\t'):
+        super(ParCzechPretrain, self).__init__(df_path, resample_rate, clean_params, sep=sep, sort=False)
+        self.label_path = label_path
+        with open(os.path.join(self.label_path, 'mp3_to_int.pickle'), 'rb') as f:
+            self.mp3_to_int = pickle.load(f)
+        # folder names are numbers starting from 0
+        self.current_folder = '-1'
+        self.current_targ_df = None
+        self.km_labels = [f'km{k}' for k in km_labels]
+
+    def get_labels(self, i):
+        mp3 = self.df.iloc[i].mp3.astype(str)
+        mp3_folder = f'{self.mp3_to_int[mp3]}'
+        if mp3_folder != self.current_folder:
+            self.get_df_from_folder(mp3_folder)
+            self.current_folder = mp3_folder
+        segment = self.df.iloc[i].segment_path
+        segment = '/'.join(segment.split('/')[-2:])
+        result_df = self.current_targ_df[self.current_targ_df.segm == segment].sort_values(by=['id'])
+        return result_df
+
+    def get_df_from_folder(self, folder_path):
+        dfs = []
+        files = os.listdir(os.path.join(self.label_path, folder_path))
+        for f in sorted(files):
+            if f.endswith('.csv'):
+                dfs.append(pd.read_csv(os.path.join(self.label_path, folder_path, f)))
+        self.current_targ_df = pd.concat(dfs).drop(columns=['mp3'])
+        ic(self.current_targ_df.columns)
+        self.current_targ_df['id'] = self.current_targ_df.path.str.split('/').str[-1].astype(int)
+
+    def __getitem__(self, i):
+        labels = self.get_labels(i)
+        batch = dict(
+            wave=self.get_wav(self.extract_path(i)),
+            target=[torch.from_numpy(labels[km].values) for km in self.km_labels],
+        )
+        return batch
 
 class HubertPretrainPL(pl.LightningModule):
     def __init__(self,
@@ -204,21 +247,37 @@ def pad_list(tensor_list):
     return result, torch.tensor(lens)
 
 
-def collate_fn(wavs_targets, nfft, frame_len, sr):
-    wavs = [x['wave'] for x in wavs_targets]
-    targets = [x['target'] for x in wavs_targets]
-
+def collate_fn(batch):
+    wavs = [x['wave'] for x in batch]
+    targets = [x['target'] for x in batch]
     padded_waves, wav_lens = pad_list(wavs)
     padded_targets, _ = pad_list(targets)
     return dict(
         waves=padded_waves,
         lens=wav_lens,
         targets=padded_targets,
-        n_frames=[compute_frames(l.item(), sr) for l in wav_lens]
     )
 
 # %%
 if __name__ == '__main__':
+    # %%
+    df_path = '/lnet/express/work/people/stankov/alignment/subset/subset.csv'
+    labels_path = '/lnet/express/work/people/stankov/alignment/clustering_all/segments'
+    parczech_clean_params = dict(
+        recognized_sound_coverage__segments_lb=0.45,
+        recognized_sound_coverage__segments_ub=0.93,
+        duration__segments_lb=0.5,
+    )
+    ks = [15, 25, 100]
+    dataset = ParCzechPretrain(
+        df_path=df_path,
+        km_labels=ks,
+        clean_params=parczech_clean_params,
+        label_path=labels_path,
+        sep=','
+    )
+
+    x = dataset[10]
     # %%
     # aux_num_out ... when provided, attach an extra linear layer on top of encoder, which can be used for fine-tuning.
     hubert_base_model = torchaudio.models.hubert_base()
