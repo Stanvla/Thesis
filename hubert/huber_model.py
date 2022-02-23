@@ -1,19 +1,22 @@
 # %%
+import os
+import pickle
+from collections import OrderedDict
+from datetime import datetime
+
+import pandas as pd
 import pytorch_lightning as pl
 import torch
+import torch.nn.functional as F
 import torchaudio
 from icecream import ic
-import os
-from pytorch_lightning.utilities.types import EVAL_DATALOADERS, TRAIN_DATALOADERS
+from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
-from collections import OrderedDict
-import torch.nn.functional as F
-from torchmetrics.functional import accuracy
 from torch import optim
-from clustering.torch_mffc_extract import compute_frames, ParCzechDataset
 from torch.utils.data import DataLoader
-import pandas as pd
-import pickle
+from torchmetrics.functional import accuracy
+
+from clustering.torch_mffc_extract import ParCzechDataset
 
 
 class ParCzechPretrain(ParCzechDataset):
@@ -55,6 +58,7 @@ class ParCzechPretrain(ParCzechDataset):
         )
         return batch
 
+
 class HubertPretrainPL(pl.LightningModule):
     def __init__(self,
                  hubert_model,
@@ -87,7 +91,7 @@ class HubertPretrainPL(pl.LightningModule):
         self.lr_inc = peak_lr / warm_up_steps
         self.lr_dec = peak_lr / (total_steps - warm_up_steps)
 
-        self.mask = 0
+        self.mask = torch.tensor(0, device=self.device)
         self.mask_loss_weight = mask_weight
 
         self.softmax_temp = softmax_temp
@@ -101,9 +105,12 @@ class HubertPretrainPL(pl.LightningModule):
             )
         )
 
+    # generate spans of masks for the batch
     def _mask_span(self, feature_batch, frames_cnt):
         masked_batch = []
         batch_mask_indices = []
+        batch_masks = []
+        # iterate over each sequence in the batch and generate mask
         for i, (features, length) in enumerate(zip(feature_batch, frames_cnt)):
             masked_cnt = int(length * self.p)
             # generate starting points for masking
@@ -112,26 +119,29 @@ class HubertPretrainPL(pl.LightningModule):
             # say self.l = 2 and mask_start[i] = 5, then need to create mask at indices 5,6,7
             index_mask = torch.stack([mask_starts + i for i in range(self.l)], dim=1).view(-1)
             batch_mask_indices.append(index_mask)
-            # create span mask
-            mask = torch.ones_like(features, device=self.device)
-            print(mask.shape)
-            mask[index_mask, :] = self.mask
-            masked_batch.append(features * mask)
-        return torch.stack(masked_batch), batch_mask_indices
+
+            # create span mask, here we use only row indices
+            mask = torch.ones(features.shape[0], device=self.device, dtype=torch.bool)
+            # for mask indices set 0
+            mask.index_fill_(0, index_mask.to(self.device), False)
+            masked_batch.append(features.masked_fill(mask.view(-1, 1), self.mask))
+            batch_masks.append(mask)
+
+        return torch.stack(masked_batch), batch_mask_indices, batch_masks
 
     def forward(self, inputs, wave_lens, inference=True):
         features_batch, frames_cnt = self.hubert_model.feature_extractor(inputs, wave_lens)
-        batch_mask_indices = None
+        batch_mask_indices, batch_masks = None, None
         if not inference:
-            features_batch, batch_mask_indices = self._mask_span(features_batch, frames_cnt)
+            features_batch, batch_mask_indices, batch_masks = self._mask_span(features_batch, frames_cnt)
 
         encoder_features = self.hubert_model.encoder(features_batch, wave_lens)
         projected_features = self.proj_layer(encoder_features)
-        return projected_features, frames_cnt, batch_mask_indices
+        return projected_features, frames_cnt, batch_mask_indices, batch_masks
 
     def _compute_cos_sim(self, projected_features):
         # projected_features.shape = [batch, n_frames, proj_dim]
-        embedded_targets = {k: layer(torch.arange(k)) for k, layer in zip(self.cluster_sizes, self.cluster_proj_layers.values())}
+        embedded_targets = {k: layer(torch.arange(k, device=self.device)) for k, layer in zip(self.cluster_sizes, self.cluster_proj_layers.values())}
 
         # compute cosine similarity for each k-means model
         # how to use cosine similarity correctly https://github.com/pytorch/pytorch/issues/11202#issuecomment-997138697
@@ -149,7 +159,22 @@ class HubertPretrainPL(pl.LightningModule):
             # similarity_scores[k].shape = [batch, n_frames, k]
         return similarity_scores
 
-    def _compute_loss_acc(self, similarity_scores, frames_cnt, targets, batch_mask_indices):
+    def _get_loss_acc(self, seq, seq_len, mask, trg):
+        # at the end extract only seq_len elements
+        new_mask = mask[:seq_len]
+        new_seq = seq[:seq_len]
+        new_trg = trg[:seq_len]
+        # to do masked_select need to add new dimension to mask
+        # then need to reshape the result of masked_select, since it flattens the tensor
+
+        new_seq = new_seq.masked_select(new_mask.unsqueeze(1)).view(-1, seq.shape[1])
+        new_trg = new_trg.masked_select(new_mask)
+        loss = F.cross_entropy(new_seq, new_trg, reduction='sum')
+        # multiply acc by the number of elements in the sequence
+        acc = accuracy(new_seq, new_trg) * new_seq.shape[0]
+        return loss, acc, new_seq.shape[0]
+
+    def _compute_loss_acc(self, similarity_scores, frames_cnt, targets, batch_mask_indices, batch_masks):
         # targets.shape = [n_clusterings, batch, n_frames]
         # n_frames.shape = [batch, ]
         # batch_mask_indices is a list, batch_mask_indices[i] = torch tensor with indices where span mask was applied
@@ -158,77 +183,108 @@ class HubertPretrainPL(pl.LightningModule):
         #   The input is expected to contain raw, unnormalized scores for each class.
         #   input has to be a Tensor of size either (minibatch, C).
         total_mask_loss, total_unmask_loss = 0, 0
-        total_mask_acc, total_unmask_acc = 0, 0
+        total_mask_acc, total_unmask_acc, total_acc = 0, 0, 0
+
         # iterate over different clustering models
         for (k, scores), k_target in zip(similarity_scores.items(), targets):
             # scores.shape = [batch, n_frames, k]
+
+            # metrics for a specific clustering model k
             clustering_mask_loss, clustering_unmask_loss = 0, 0
-            clustering_mask_acc, clustering_unmask_acc = 0, 0
+            clustering_mask_acc, clustering_unmask_acc, clustering_total_acc = 0, 0, 0
+            cnt_mask, cnt_unmask, cnt_total = 0, 0, 0
 
             # iterate over sequences in the batch
-            for seq_score, target, seq_len, index_mask in zip(scores, k_target, frames_cnt, batch_mask_indices):
+            for seq_score, target, seq_len, mask in zip(scores, k_target, frames_cnt, batch_masks):
                 # seq_score.shape = [n_frames, k]
                 # target.shape = [n_frames]
                 # index_mask.shape = [n_masked_frames] ... differs for each sequence, that is why processing each seq separately
                 # seq_len is an int
 
-                valid_seq_score = seq_score[:seq_len]
-                target = target[:seq_len]
-                # valid_seq_score.shape = [seq_len, k]
-                # cross entropy loss over masked frames
-                mask_loss = F.cross_entropy(valid_seq_score[index_mask], target[index_mask], reduction='sum')
-                mask_acc = accuracy(valid_seq_score[index_mask], target[index_mask], )
+                # cross entropy loss and acc over frames without mask
+                unmask_loss, unmask_acc, unmask_size = self._get_loss_acc(seq_score, seq_len, mask, target)
+                clustering_unmask_loss += unmask_loss
+                clustering_unmask_acc += unmask_acc
+                cnt_unmask += unmask_size
+
+                # cross entropy loss and acc over frames with mask
+                mask_loss, mask_acc, mask_size = self._get_loss_acc(seq_score, seq_len, ~mask, target)
                 clustering_mask_loss += mask_loss
                 clustering_mask_acc += mask_acc
+                cnt_mask += mask_size
 
-                # cross entropy loss over frames without mask
-                index_unmask = torch.ones(valid_seq_score.shape[0], device=self.device, dtype=torch.bool)
-                index_unmask[index_mask] = False
-                unmask_loss = F.cross_entropy(valid_seq_score[index_unmask], target[index_unmask], reduction='sum')
-                unmask_acc = accuracy(valid_seq_score[index_unmask], target[index_unmask], )
-                clustering_unmask_acc += unmask_acc
-                clustering_unmask_loss += unmask_loss
+                # total accuracy
+                clustering_total_acc += accuracy(seq_score[:seq_len], target[:seq_len]) * seq_len
+                cnt_total += seq_len
+
             # average across batch
             total_mask_loss += clustering_mask_loss / scores.shape[0]
             total_unmask_loss += clustering_unmask_loss / scores.shape[0]
 
-            total_mask_acc += clustering_mask_acc / scores.shape[0]
-            total_unmask_acc += clustering_unmask_acc / scores.shape[0]
-
-        return total_mask_loss, total_unmask_loss, total_mask_acc, total_unmask_acc
+            total_mask_acc += clustering_mask_acc / cnt_mask
+            total_unmask_acc += clustering_unmask_acc / cnt_unmask
+            total_acc += clustering_total_acc / cnt_total
+        # total_{mask,unmask}_{loss,acc} are sums of losses for different clustering models
+        return total_mask_loss, total_unmask_loss, total_mask_acc / len(similarity_scores), total_unmask_acc / len(similarity_scores), total_acc / len(
+            similarity_scores)
 
     def training_step(self, batch, batch_index, inference=False):
         inputs, wave_lens, targets = batch['waves'], batch['lens'], batch['targets']
         # inputs.shape = [batch, max_wave_len]
         # targets.shape = [batch, n_frames] ... here n_frames << max_wave_len
 
-        projected_features, frames_cnt, batch_mask_indices = self(inputs, wave_lens, inference=inference)
+        projected_features, frames_cnt, batch_mask_indices, batch_masks = self(inputs, wave_lens, inference=inference)
         # projected_features.shape = [batch, n_frames, proj_dim]
-        ic(frames_cnt)
-        ic(targets[0].shape)
         similarity_scores = self._compute_cos_sim(projected_features)
 
-        mask_loss, unmask_loss, mask_acc, unmask_acc = self._compute_loss_acc(similarity_scores, frames_cnt, targets, batch_mask_indices)
+        mask_loss, unmask_loss, mask_acc, unmask_acc, total_acc = self._compute_loss_acc(similarity_scores, frames_cnt, targets, batch_mask_indices,
+                                                                                         batch_masks)
         total_loss = self.mask_loss_weight * mask_loss + (1 - self.mask_loss_weight) * unmask_loss
-        return dict(loss=total_loss, mask_loss=mask_loss, unmask_loss=unmask_loss, mask_acc=mask_acc, unmask_acc=unmask_acc, batch_size=inputs.shape[0])
+        return dict(
+            loss=total_loss,
+            mask_loss=mask_loss,
+            unmask_loss=unmask_loss,
+            mask_acc=mask_acc,
+            unmask_acc=unmask_acc,
+            total_acc=total_acc,
+            batch_size=inputs.shape[0]
+        )
 
     def validation_step(self, batch, batch_index):
         return self.training_step(batch, batch_index, inference=True)
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=0, betas=self.betas)
+        # optimizer = optim.Adam(self.parameters(), lr=0.001, betas=self.betas)
+        optimizer = optim.Adam(self.parameters(), lr=0.001)
         return dict(optimizer=optimizer)
 
-    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx=0, optimizer_closure=None, on_tpu=False, using_native_amp=False, using_lbfgs=False):
-        if self.trainer.global_step < self.warm_up_steps:
-            lr_scale = self.lr_inc
-        else:
-            lr_scale = - self.lr_dec
+    # def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx=0, optimizer_closure=None, on_tpu=False, using_native_amp=False, using_lbfgs=False):
+    #     if self.trainer.global_step < self.warm_up_steps:
+    #         lr_scale = self.lr_inc
+    #     else:
+    #         lr_scale = - self.lr_dec
+    #
+    #     for pg in optimizer.param_groups:
+    #         pg['lr'] += lr_scale
+    #
+    #     optimizer.step(closure=optimizer_closure)
 
-        for pg in optimizer.param_groups:
-            pg['lr'] += lr_scale
+    def training_epoch_end(self, outputs):
+        total_loss = sum(out['loss'] for out in outputs) / len(outputs)
+        masked_loss = sum(out['mask_loss'] for out in outputs) / len(outputs)
+        unmasked_loss = sum(out['unmask_loss'] for out in outputs) / len(outputs)
 
-        optimizer.step(closure=optimizer_closure)
+        total_acc = sum(out['total_acc'] for out in outputs) / len(outputs)
+        masked_acc = sum(out['mask_acc'] for out in outputs) / len(outputs)
+        unmasked_acc = sum(out['unmask_acc'] for out in outputs) / len(outputs)
+
+        self.logger.experiment.add_scalar(f'Loss/Total', total_loss, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Loss/Masked', masked_loss, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Loss/Unmasked', unmasked_loss, self.current_epoch)
+
+        self.logger.experiment.add_scalar(f'Acc/Total', total_acc, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Acc/Masked', masked_acc, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Acc/Unmasked', unmasked_acc, self.current_epoch)
 
 
 def gen_wav_targ(wav_sec, classes, sr, frame_len):
@@ -236,7 +292,7 @@ def gen_wav_targ(wav_sec, classes, sr, frame_len):
     n_frames = int(wav_sec // frame_len)
     return dict(
         wave=torch.rand(samples),
-        target=torch.randint(classes, size=(n_frames, ))
+        target=torch.randint(classes, size=(n_frames,))
     )
 
 
@@ -247,6 +303,7 @@ def pad_list(tensor_list):
         F.pad(t, (0, max_len - t.shape[-1])) for t in tensor_list
     ])
     return result, torch.tensor(lens), max_len
+
 
 class Collator:
     def __init__(self, n_classes):
@@ -270,6 +327,7 @@ class Collator:
             targets=padded_targets,
         )
 
+
 # %%
 if __name__ == '__main__':
     # %%
@@ -285,13 +343,13 @@ if __name__ == '__main__':
         batch_size=2,
         num_workers=os.cpu_count(),
         # pin_memory=False,
-        # num_workers=4,
         pin_memory=False,
         ignore_index=-1,
-        epochs=5,
+        epochs=20,
+        mask_weight=0.5,
     )
 
-    ks = [15, 25, 100]
+    ks = [15, 25]
 
     # ............................................... Dataset .......................................................
     dataset = ParCzechPretrain(
@@ -310,7 +368,7 @@ if __name__ == '__main__':
         hubert_base_model,
         cluster_sizes=ks,
         proj_dim=256,
-        mask_weight=0.5,
+        mask_weight=params['mask_weight'],
         softmax_temp=0.1,
         betas=(0.9, 0.98),
         warm_up_steps=100,
@@ -323,17 +381,23 @@ if __name__ == '__main__':
     )
 
     # ............................................... Training .......................................................
-    # trainer = pl.Trainer(gpus=2, strategy='ddp', logger=logger, profiler=profiler, num_sanity_val_steps=0, max_epochs=params['epochs'], callbacks=cb,
-    #                      deterministic=True,
-    #                      precision=16)
+    # Logs are saved to os.path.join(save_dir, name, version)
+    # save_dir/name/sub_dir/version
+    logger = TensorBoardLogger(
+        save_dir='logs',
+        name=f'clusters={"_".join(list(map(str, ks)))}_mw={params["mask_weight"]:.2f}__' + datetime.now().strftime('%d.%m__%H.%M'),
+    )
 
     trainer = pl.Trainer(
         num_sanity_val_steps=0,
         max_epochs=params['epochs'],
         deterministic=True,
-        check_val_every_n_epoch=0,
-        fast_dev_run=10,
+        # check_val_every_n_epoch=0,
+        # fast_dev_run=10,
+        overfit_batches=2,
         gpus=1,
+        checkpoint_callback=False,
+        logger=logger
     )
 
     trainer.fit(hubert_pretrain, dataloader)
@@ -394,4 +458,3 @@ if __name__ == '__main__':
     )
 
     l = hubert_pretrain.training_step(batch, 1)
-
