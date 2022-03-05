@@ -16,7 +16,7 @@ from torch import optim
 from torch.utils.data import DataLoader
 from torchmetrics.functional import accuracy
 
-from clustering.torch_mffc_extract import ParCzechDataset
+from hubert.clustering.torch_mffc_extract import ParCzechDataset
 
 
 class ParCzechPretrain(ParCzechDataset):
@@ -29,6 +29,7 @@ class ParCzechPretrain(ParCzechDataset):
         self.current_folder = '-1'
         self.current_targ_df = None
         self.km_labels = [f'km{k}' for k in km_labels]
+        self.labels = km_labels
 
     def get_labels(self, i):
         mp3 = self.df.iloc[i].mp3.astype(str)
@@ -54,7 +55,7 @@ class ParCzechPretrain(ParCzechDataset):
         labels = self.get_labels(i)
         batch = dict(
             wave=self.get_wav(self.extract_path(i)),
-            target=[torch.from_numpy(labels[km].values) for km in self.km_labels],
+            target={k: torch.from_numpy(labels[km].values) for km, k in zip(self.km_labels, self.labels)},
         )
         return batch
 
@@ -73,7 +74,9 @@ class HubertPretrainPL(pl.LightningModule):
                  peak_lr=5e-4,
                  p=0.08,
                  l=10,
-                 ignore_index=-1
+                 ignore_index=-1,
+                 sim=True,
+                 reduction='sum',
                  ):
         super().__init__()
         # can access Conv feature extractor using hubert_base_model.feature_extractor and BERT using hubert_base_model.encoder
@@ -82,9 +85,11 @@ class HubertPretrainPL(pl.LightningModule):
         # https://github.com/pytorch/audio/tree/main/torchaudio/models/wav2vec2
         self.hubert_model = hubert_model
         self.ignore_index = ignore_index
-
         self.p = p
         self.l = l
+
+        self.sim = sim
+        self.reduction = reduction
 
         self.betas = betas
         self.warm_up_steps = warm_up_steps
@@ -98,8 +103,22 @@ class HubertPretrainPL(pl.LightningModule):
 
         self.proj_dim = proj_dim
         self.cluster_sizes = cluster_sizes
+        self.cluster_sizes_str = [f'{k}' for k in cluster_sizes]
+
         self.proj_layer = nn.Linear(in_features=hubert_features, out_features=proj_dim)
-        self.cluster_proj_layers = nn.ModuleDict(
+        self.encoder_proj_layers_sim = nn.ModuleDict(
+            OrderedDict(
+                ((k, nn.Linear(in_features=hubert_features, out_features=proj_dim)) for k in self.cluster_sizes_str)
+            )
+        )
+
+        self.encoder_proj_layers_cls = nn.ModuleDict(
+            OrderedDict(
+                ((f'{k}', nn.Linear(in_features=hubert_features, out_features=k)) for k in self.cluster_sizes)
+            )
+        )
+
+        self.target_proj_layers = nn.ModuleDict(
             OrderedDict(
                 ((f'{k}', nn.Embedding(num_embeddings=k, embedding_dim=proj_dim)) for k in cluster_sizes)
             )
@@ -107,7 +126,9 @@ class HubertPretrainPL(pl.LightningModule):
 
     # generate spans of masks for the batch
     def _mask_span(self, feature_batch, frames_cnt):
-        masked_batch = []
+        # feature_batch.shape = [batch, max_seq_len, cnn_features]
+        # frames_cnt.shape = [batch]
+
         batch_mask_indices = []
         batch_masks = []
         # iterate over each sequence in the batch and generate mask
@@ -121,27 +142,39 @@ class HubertPretrainPL(pl.LightningModule):
             batch_mask_indices.append(index_mask)
 
             # create span mask, here we use only row indices
-            mask = torch.ones(features.shape[0], device=self.device, dtype=torch.bool)
-            # for mask indices set 0
-            mask.index_fill_(0, index_mask.to(self.device), False)
-            masked_batch.append(features.masked_fill(mask.view(-1, 1), self.mask))
+            mask = torch.zeros(features.shape[0], device=self.device, dtype=torch.bool)
+            # for mask indices set True
+            mask.index_fill_(0, index_mask.to(self.device), True)
+            # so where the mask is True we will replace the values
             batch_masks.append(mask)
 
-        return torch.stack(masked_batch), batch_mask_indices, batch_masks
+        batch_masks = torch.stack(batch_masks)
+        masked_batch = feature_batch.masked_fill(batch_masks.view(-1), self.mask)
+        ic(masked_batch[0])
+        return masked_batch, batch_mask_indices, batch_masks
 
     def forward(self, inputs, wave_lens, inference=True):
+        # inputs.shape = [batch, max_wave_len]
+        # wave_lens.shape = [batch]
+
         features_batch, frames_cnt = self.hubert_model.feature_extractor(inputs, wave_lens)
         batch_mask_indices, batch_masks = None, None
         if not inference:
             features_batch, batch_mask_indices, batch_masks = self._mask_span(features_batch, frames_cnt)
 
-        encoder_features = self.hubert_model.encoder(features_batch, wave_lens)
-        projected_features = self.proj_layer(encoder_features)
-        return projected_features, frames_cnt, batch_mask_indices, batch_masks
+        encoder_features = self.hubert_model.encoder(features_batch, frames_cnt)
+        return encoder_features, frames_cnt, batch_mask_indices, batch_masks
 
-    def _compute_cos_sim(self, projected_features):
-        # projected_features.shape = [batch, n_frames, proj_dim]
-        embedded_targets = {k: layer(torch.arange(k, device=self.device)) for k, layer in zip(self.cluster_sizes, self.cluster_proj_layers.values())}
+    def _compute_cos_sim(self, encoder_features):
+        if not self.sim:
+            projected_features_dict = {k: self.encoder_proj_layers_cls[f'{k}'](encoder_features) for k in self.cluster_sizes}
+            return projected_features_dict
+
+        # projected_features[k].shape = [batch, n_frames, proj_dim]
+        # k is an int that gives the number of clusters for some K-means model
+        projected_features_dict = {k: self.encoder_proj_layers_sim[f'{k}'](encoder_features) / self.softmax_temp for k in self.cluster_sizes}
+
+        embedded_targets = {k: layer(torch.arange(k, device=self.device)) for k, layer in zip(self.cluster_sizes, self.target_proj_layers.values())}
 
         # compute cosine similarity for each k-means model
         # how to use cosine similarity correctly https://github.com/pytorch/pytorch/issues/11202#issuecomment-997138697
@@ -149,17 +182,25 @@ class HubertPretrainPL(pl.LightningModule):
         #   pairwise_sim = F.cosine_similarity(x1[:, None, :], x2[None, :, :], dim=-1)
         # [m, 1, d], [1, n, d] --> [m , n]
         similarity_scores = {}
+        # similarity_scores[k].shape = [batch, n_frames, k]
+
         for k, embedded_target in embedded_targets.items():
             # embedded_targets[k].shape = [k, self.proj_dim]
+            projected_features = projected_features_dict[k]
+
             similarity_scores[k] = F.cosine_similarity(
                 projected_features[:, :, None, :],  # [batch, n_frames, 1, proj_dim]
                 embedded_target[None, None, :, :],  # [1,     1,        k, proj_dim]
                 dim=-1  # common dimension
-            ) * self.softmax_temp
+            ) / self.softmax_temp
             # similarity_scores[k].shape = [batch, n_frames, k]
         return similarity_scores
 
     def _get_loss_acc(self, seq, seq_len, mask, trg):
+        # seq.shape = [max_seq_len, k]
+        # mask.shape = [max_seq_len]
+        # trg.shape = [max_seq_len]
+
         # at the end extract only seq_len elements
         new_mask = mask[:seq_len]
         new_seq = seq[:seq_len]
@@ -169,19 +210,23 @@ class HubertPretrainPL(pl.LightningModule):
 
         new_seq = new_seq.masked_select(new_mask.unsqueeze(1)).view(-1, seq.shape[1])
         new_trg = new_trg.masked_select(new_mask)
-        loss = F.cross_entropy(new_seq, new_trg, reduction='sum')
+
+        # cross_entropy recap
+        #   The input is expected to contain raw, unnormalized scores for each class.
+        #   input has to be a Tensor of size either (minibatch, C).
+        loss = F.cross_entropy(new_seq, new_trg, reduction=self.reduction)
         # multiply acc by the number of elements in the sequence
         acc = accuracy(new_seq, new_trg) * new_seq.shape[0]
         return loss, acc, new_seq.shape[0]
 
     def _compute_loss_acc(self, similarity_scores, frames_cnt, targets, batch_mask_indices, batch_masks):
-        # targets.shape = [n_clusterings, batch, n_frames]
-        # n_frames.shape = [batch, ]
-        # batch_mask_indices is a list, batch_mask_indices[i] = torch tensor with indices where span mask was applied
+        # similarity_scores[k].shape = [batch, n_frames, k]  (similarity_scores is a dict)
+        # frames_cnt.shape = [batch]
+        # targets[i].shape = [batch, n_frames]  (targets is a list)
+        # batch_mask_indices[i] = tensor with indices with masked frames (batch_mask_indices is a list)
+        # batch_masks[i].shape = [n_frames]  (batch_masks is a list)
 
-        # cross_entropy recap
-        #   The input is expected to contain raw, unnormalized scores for each class.
-        #   input has to be a Tensor of size either (minibatch, C).
+
         total_mask_loss, total_unmask_loss = 0, 0
         total_mask_acc, total_unmask_acc, total_acc = 0, 0, 0
 
@@ -231,13 +276,15 @@ class HubertPretrainPL(pl.LightningModule):
     def training_step(self, batch, batch_index, inference=False):
         inputs, wave_lens, targets = batch['waves'], batch['lens'], batch['targets']
         # inputs.shape = [batch, max_wave_len]
-        # targets.shape = [batch, n_frames] ... here n_frames << max_wave_len
+        # wave_lens.shape = [batch]
+        # targets[k].shape = [batch, n_frames] ... targets is a dict and n_frames << max_wave_len
 
-        projected_features, frames_cnt, batch_mask_indices, batch_masks = self(inputs, wave_lens, inference=inference)
-        # projected_features.shape = [batch, n_frames, proj_dim]
-        similarity_scores = self._compute_cos_sim(projected_features)
+        encoder_features, frames_cnt, batch_mask_indices, batch_masks = self(inputs, wave_lens, inference=inference)
+        # encoder_features.shape = [batch, max_seq_len, hubert_features]
+        scores = self._compute_cos_sim(encoder_features)
+        # scores[k].shape = [batch, n_frames, k]
 
-        mask_loss, unmask_loss, mask_acc, unmask_acc, total_acc = self._compute_loss_acc(similarity_scores, frames_cnt, targets, batch_mask_indices,
+        mask_loss, unmask_loss, mask_acc, unmask_acc, total_acc = self._compute_loss_acc(scores, frames_cnt, targets, batch_mask_indices,
                                                                                          batch_masks)
         total_loss = self.mask_loss_weight * mask_loss + (1 - self.mask_loss_weight) * unmask_loss
         return dict(
@@ -287,40 +334,36 @@ class HubertPretrainPL(pl.LightningModule):
         self.logger.experiment.add_scalar(f'Acc/Unmasked', unmasked_acc, self.current_epoch)
 
 
-def gen_wav_targ(wav_sec, classes, sr, frame_len):
-    samples = int(sr * wav_sec)
-    n_frames = int(wav_sec // frame_len)
-    return dict(
-        wave=torch.rand(samples),
-        target=torch.randint(classes, size=(n_frames,))
-    )
-
-
-def pad_list(tensor_list):
-    lens = [t.shape[-1] for t in tensor_list]
-    max_len = max(lens)
-    result = torch.stack([
-        F.pad(t, (0, max_len - t.shape[-1])) for t in tensor_list
-    ])
-    return result, torch.tensor(lens), max_len
-
-
 class Collator:
-    def __init__(self, n_classes):
-        self.n_classes = n_classes
+    def __init__(self, classes, padding):
+        self.classes = classes
+        self.pad_value = padding
+
+    def pad_list(self, tensor_list):
+        lens = [t.shape[-1] for t in tensor_list]
+        max_len = max(lens)
+        result = torch.stack([
+            F.pad(t, (0, max_len - t.shape[-1]), value=self.pad_value) for t in tensor_list
+        ])
+        return result, torch.tensor(lens), max_len
 
     def __call__(self, batch):
-        wavs = [x['wave'] for x in batch]
-        padded_waves, wav_lens, max_len = pad_list(wavs)
-        padded_waves = padded_waves.view(len(batch), max_len)
-        # each target in this list is a list of target_tensors for different k
-        targets = [x['target'] for x in batch]
-        targets_by_k = []
-        for i in range(self.n_classes):
-            lst = [t[i] for t in targets]
-            targets_by_k.append(lst)
+        # batch is a list of dicts, with keys [wave, target]
+        # batch[i]['target'] is also a dict with keys given by different k from k-means models
 
-        padded_targets = [pad_list(t)[0] for t in targets_by_k]
+        wavs = [x['wave'] for x in batch]
+        padded_waves, wav_lens, max_len = self.pad_list(wavs)
+        padded_waves = padded_waves.view(len(batch), max_len)
+
+        # targets_by_k[k] is a list of tensors, it can be viewed as unpadded batch
+        targets_by_k = {}
+        for k in self.classes:
+            lst_k = [x['target'][k] for x in batch]
+            targets_by_k[k] = lst_k
+
+        # use only first element from pad_list() since it returns multiple things
+        padded_targets = {k: self.pad_list(lst)[0] for k, lst in targets_by_k.items()}
+
         return dict(
             waves=padded_waves,
             lens=wav_lens,
@@ -345,13 +388,17 @@ if __name__ == '__main__':
         # pin_memory=False,
         pin_memory=False,
         ignore_index=-1,
-        epochs=20,
+        epochs=25,
         mask_weight=0.5,
+        softmax_temp=0.1,
+        overfit_batches=1,
+        sim=False,
+        reduction='mean',
     )
 
     ks = [15, 25]
-
     # ............................................... Dataset .......................................................
+
     dataset = ParCzechPretrain(
         df_path=df_path,
         km_labels=ks,
@@ -359,8 +406,13 @@ if __name__ == '__main__':
         label_path=labels_path,
         sep=','
     )
-    collate_fn = Collator(len(ks))
+    collate_fn = Collator(ks, padding=params['ignore_index'])
     dataloader = DataLoader(dataset, batch_size=params['batch_size'], shuffle=False, collate_fn=collate_fn, num_workers=os.cpu_count() // 4, pin_memory=True)
+
+    # %%
+    iterator = next(iter(dataloader))
+
+    # %%
 
     # ............................................... Model .......................................................
     hubert_base_model = torchaudio.models.hubert_base()
@@ -369,7 +421,7 @@ if __name__ == '__main__':
         cluster_sizes=ks,
         proj_dim=256,
         mask_weight=params['mask_weight'],
-        softmax_temp=0.1,
+        softmax_temp=params['softmax_temp'],
         betas=(0.9, 0.98),
         warm_up_steps=100,
         total_steps=500,
@@ -377,7 +429,9 @@ if __name__ == '__main__':
         peak_lr=5e-4,
         p=0.08,
         l=10,
-        ignore_index=params['ignore_index']
+        ignore_index=params['ignore_index'],
+        sim=params['sim'],
+        reduction=params['reduction']
     )
 
     # ............................................... Training .......................................................
@@ -385,7 +439,13 @@ if __name__ == '__main__':
     # save_dir/name/sub_dir/version
     logger = TensorBoardLogger(
         save_dir='logs',
-        name=f'clusters={"_".join(list(map(str, ks)))}_mw={params["mask_weight"]:.2f}__' + datetime.now().strftime('%d.%m__%H.%M'),
+        name=f'clusters={"_".join(list(map(str, ks)))}_'
+             f'mw={params["mask_weight"]:.2f}_'
+             f'st={params["softmax_temp"]:.2f}_'
+             f'overfit={params["overfit_batches"]}_'
+             f'sim=f{params["sim"]}'
+             f'_red={params["reduction"]}_'
+             + '_' + datetime.now().strftime('%d.%m__%H.%M'),
     )
 
     trainer = pl.Trainer(
@@ -394,7 +454,7 @@ if __name__ == '__main__':
         deterministic=True,
         # check_val_every_n_epoch=0,
         # fast_dev_run=10,
-        overfit_batches=2,
+        overfit_batches=params['overfit_batches'],
         gpus=1,
         checkpoint_callback=False,
         logger=logger
