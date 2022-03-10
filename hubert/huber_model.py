@@ -1,141 +1,17 @@
 # %%
-import os
-import pickle
 from collections import OrderedDict
 from datetime import datetime
-from typing import Optional
-
-import pandas as pd
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 import torchaudio
 from icecream import ic
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.utilities.types import TRAIN_DATALOADERS
 from torch import nn
 from torch import optim
-from torch.utils.data import DataLoader
 from torchmetrics.functional import accuracy
+from hubert.pretrain_dataset import ParCzechPretrainPL
 
-from hubert.clustering.torch_mffc_extract import ParCzechDataset
-
-
-class ParCzechPretrain(ParCzechDataset):
-    def __init__(self, df_path, km_labels, resample_rate=16000, clean_params=None, label_path=None, sep='\t'):
-        super(ParCzechPretrain, self).__init__(df_path, resample_rate, clean_params, sep=sep, sort=False)
-        self.label_path = label_path
-        with open(os.path.join(self.label_path, 'mp3_to_int.pickle'), 'rb') as f:
-            self.mp3_to_int = pickle.load(f)
-        # folder names are numbers starting from 0
-        self.current_folder = '-1'
-        self.current_targ_df = None
-        self.km_labels = [f'km{k}' for k in km_labels]
-        self.labels = km_labels
-
-    def get_labels(self, i):
-        mp3 = self.df.iloc[i].mp3.astype(str)
-        mp3_folder = f'{self.mp3_to_int[mp3]}'
-        if mp3_folder != self.current_folder:
-            self.get_df_from_folder(mp3_folder)
-            self.current_folder = mp3_folder
-        segment = self.df.iloc[i].segment_path
-        segment = '/'.join(segment.split('/')[-2:])
-        result_df = self.current_targ_df[self.current_targ_df.segm == segment].sort_values(by=['id'])
-        return result_df
-
-    def get_df_from_folder(self, folder_path):
-        dfs = []
-        files = os.listdir(os.path.join(self.label_path, folder_path))
-        for f in sorted(files):
-            if f.endswith('.csv'):
-                dfs.append(pd.read_csv(os.path.join(self.label_path, folder_path, f)))
-        self.current_targ_df = pd.concat(dfs).drop(columns=['mp3'])
-        self.current_targ_df['id'] = self.current_targ_df.path.str.split('/').str[-1].astype(int)
-
-    def __getitem__(self, i):
-        labels = self.get_labels(i)
-        return dict(
-            wave=self.get_wav(self.extract_path(i)),
-            target={k: torch.from_numpy(labels[km].values) for km, k in zip(self.km_labels, self.labels)},
-            idx=i,
-        )
-
-
-class Collator:
-    def __init__(self, classes, padding):
-        self.classes = classes
-        self.pad_value = padding
-
-    def pad_list(self, tensor_list):
-        lens = [t.shape[-1] for t in tensor_list]
-        max_len = max(lens)
-        result = torch.stack([
-            F.pad(t, (0, max_len - t.shape[-1]), value=self.pad_value) for t in tensor_list
-        ])
-        return result, torch.tensor(lens), max_len
-
-    def __call__(self, batch):
-        # batch is a list of dicts, with keys [wave, target]
-        # batch[i]['target'] is also a dict with keys given by different k from k-means models
-
-        indices = [x['idx'] for x in batch]
-        wavs = [x['wave'] for x in batch]
-        padded_waves, wav_lens, max_len = self.pad_list(wavs)
-        padded_waves = padded_waves.view(len(batch), max_len)
-
-        # targets_by_k[k] is a list of tensors, it can be viewed as unpadded batch
-        targets_by_k = {}
-        for k in self.classes:
-            lst_k = [x['target'][k] for x in batch]
-            targets_by_k[k] = lst_k
-
-        # use only first element from pad_list() since it returns multiple things
-        padded_targets = {k: self.pad_list(lst)[0] for k, lst in targets_by_k.items()}
-
-        return dict(
-            waves=padded_waves,
-            lens=wav_lens,
-            targets=padded_targets,
-            idx=torch.tensor(indices)
-        )
-
-
-class ParCzechPretrainPL(pl.LightningDataModule):
-    def __init__(self, clean_params, data_path, km_labels, labels_path, num_workers, num_gpus, pin_mem, shuffle, batch_size, ignore_index):
-        super(ParCzechPretrainPL, self).__init__()
-        self.clean_params = clean_params
-        self.data_path = data_path
-        self.km_labels = km_labels
-        self.labels_path = labels_path
-        self.num_workers = num_workers
-        self.num_gpus = num_gpus
-        self.pin_mem = pin_mem
-        self.shuffle = shuffle
-        self.bs = batch_size
-        self.ignore_index = ignore_index
-
-    def setup(self, stage: Optional[str] = None) -> None:
-        self.train_data = ParCzechPretrain(
-            df_path=self.data_path,
-            km_labels=self.km_labels,
-            clean_params=self.clean_params,
-            label_path=self.labels_path,
-            sep=','
-        )
-        self.collate_fn = Collator(self.km_labels, self.ignore_index)
-
-        self.train_loader = DataLoader(
-            self.train_data,
-            batch_size=self.bs,
-            shuffle=self.shuffle,
-            collate_fn=self.collate_fn,
-            num_workers=self.num_workers / self.num_gpus if self.num_gpus != 0 else self.num_workers,
-            pin_memory=self.pin_mem
-        )
-
-    def train_dataloader(self) -> TRAIN_DATALOADERS:
-        return self.train_loader
 
 class HubertPretrainPL(pl.LightningModule):
     def __init__(self,
