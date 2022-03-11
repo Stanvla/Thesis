@@ -99,6 +99,7 @@ class DistributedSampler(torch.utils.data.Sampler[T_co]):
             self,
             dataset: ParCzechDataset,
             batch_size: int,
+            batch_scale: int,
             num_replicas: Optional[int] = None,
             rank: Optional[int] = None,
             shuffle: bool = True,
@@ -121,6 +122,8 @@ class DistributedSampler(torch.utils.data.Sampler[T_co]):
 
         self.dataset = dataset
         self.batch_size = batch_size
+        self.effective_batch_size = batch_size * num_replicas
+        self.scaled_batch_size = self.effective_batch_size * batch_scale
 
         self.num_replicas = num_replicas
         self.rank = rank
@@ -144,19 +147,50 @@ class DistributedSampler(torch.utils.data.Sampler[T_co]):
 
     def _get_indices(self):
         # todo:
-        # 	1. indices should be ordered by the dict
-        # 	2. sort by length inside the bins
+        # 	ok 1. indices should be ordered by the dict
+        # 	ok 2. sort by length inside the bins
+        #   ok 3. batches should not be sorted by length, although the lengths inside batch should be very similar
+        #      4. handle drop last
+
+        folders = self.dataset.df.folder_int.unique()
+        all_batches = []
+
         generator = torch.Generator()
         generator.manual_seed(self.seed + self.epoch)
 
-        if self.shuffle:
-            # deterministically shuffle based on epoch and seed
-            indices = torch.randperm(len(self.dataset), generator=generator).tolist()
-        else:
-            indices = []
-            for lst in self.dataset.mp3_to_int.values():
-                indices.extend(lst)
+        for f in folders:
+            folder_durations = dataset.df[dataset.df.folder_int == f].duration__segments
+            folder_indices = folder_durations.index.values
 
+            # shuffle the folder_indices
+            if self.shuffle:
+                folder_shuffled_index = torch.randperm(len(folder_indices), generator=generator).tolist()
+                folder_indices = folder_indices[folder_shuffled_index]
+
+            folder_batches = []
+            folder_ub_large = math.ceil(len(folder_indices) / self.scaled_batch_size)
+
+            # create subsets of the size self.scaled_batch_size, inside these subsets sort audio segments by length
+            for i in range(folder_ub_large):
+                # the subset will be sorted by duration
+                subset_indices = folder_indices[i * self.scaled_batch_size: min(len(folder_indices), (i + 1) * self.scaled_batch_size)]
+                subset_durations = folder_durations[subset_indices]
+                subset_durations = subset_durations.sort_values()
+                subset_indices = subset_durations.index
+
+                ub_batch = math.ceil(len(subset_indices) / self.effective_batch_size)
+                # divide the subset into batches and shuffle audio segments inside the batch
+                for j in range(ub_batch):
+                    batch_indices = subset_indices[j * self.effective_batch_size: min(len(subset_indices), (j + 1) * self.effective_batch_size)]
+
+                    # shuffle batch indices, so the batch is not sorted by the length
+                    if self.shuffle:
+                        batch_shuffled_index = torch.randperm(len(batch_indices), generator=generator).tolist()
+                        batch_indices = batch_indices[batch_shuffled_index]
+
+                    folder_batches.extend(batch_indices)
+
+            all_batches.append(folder_batches)
         return indices
 
     def __iter__(self):
@@ -307,47 +341,7 @@ if __name__ == '__main__':
         label_path=labels_path,
         sep=',',
     )
-    # %%
-    effective_batch = params['num_gpus'] * params['batch_size']
-    large_batch_size = params['batch_scale'] * effective_batch
 
-    folders = dataset.df.folder_int.unique()
-    all_batches = []
-    all_folders = []
-
-    generator = torch.Generator()
-    generator.manual_seed(1)
-
-    for f in folders:
-        folder_durations = dataset.df[dataset.df.folder_int == f].duration__segments
-        folder_indices = folder_durations.index.values
-        # shuffle the folder_indices
-        folder_shuffled_index = torch.randperm(len(folder_indices), generator=generator).tolist()
-        folder_indices = folder_indices[folder_shuffled_index]
-
-        folder_subsets = []
-        folder_batches = []
-        folder_ub_large = math.ceil(len(folder_indices) / large_batch_size)
-
-        # create subsets of the size large_batch_size
-        for i in range(folder_ub_large):
-            # the subset will be sorted by duration
-            subset_indices = folder_indices[i * large_batch_size: min(len(folder_indices), (i + 1) * large_batch_size)]
-            subset_durations = folder_durations[subset_indices]
-            subset_durations = subset_durations.sort_values()
-            subset_indices = subset_durations.index
-
-            ub_batch = math.ceil(len(subset_durations) / effective_batch)
-            # now from subset_indices get effective batch and shuffle the batch
-            for j in range(ub_batch):
-                batch_indices = subset_indices[j * effective_batch: min(len(subset_durations), (j+1) * effective_batch)]
-                # shuffle batch indices, so the batch is not sorted by the length
-                batch_indices = batch_indices[torch.randperm(len(batch_indices), generator=generator).tolist()]
-
-                folder_batches.append(batch_indices)
-
-        all_batches.append(folder_batches)
-        all_folders.append(folder_indices)
     # %%
     # %%
 
