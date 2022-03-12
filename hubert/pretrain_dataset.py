@@ -145,20 +145,23 @@ class DistributedSampler(torch.utils.data.Sampler[T_co]):
         self.shuffle = shuffle
         self.seed = seed
 
+
     def _get_indices(self):
-        # todo:
-        # 	ok 1. indices should be ordered by the dict
-        # 	ok 2. sort by length inside the bins
-        #   ok 3. batches should not be sorted by length, although the lengths inside batch should be very similar
-        #      4. handle drop last
-
-        folders = self.dataset.df.folder_int.unique()
-        all_batches = []
-
         generator = torch.Generator()
         generator.manual_seed(self.seed + self.epoch)
 
-        for f in folders:
+        folders = self.dataset.df.folder_int.unique()
+        all_batch_indices = []
+        folder_idx_enlarge = 0
+        padding_size = 0
+
+        if not self.drop_last:
+            # get folder index that will be enlarged
+            if self.shuffle:
+                folder_idx_enlarge = torch.randint(len(folders), (1, ), generator=generator).item()
+            padding_size = self.total_size - len(self.dataset)
+
+        for idx, f in enumerate(folders):
             folder_durations = dataset.df[dataset.df.folder_int == f].duration__segments
             folder_indices = folder_durations.index.values
 
@@ -167,7 +170,15 @@ class DistributedSampler(torch.utils.data.Sampler[T_co]):
                 folder_shuffled_index = torch.randperm(len(folder_indices), generator=generator).tolist()
                 folder_indices = folder_indices[folder_shuffled_index]
 
-            folder_batches = []
+            # add extra samples to make dataset evenly divisible
+            if idx == folder_idx_enlarge and not self.drop_last:
+                if padding_size <= len(folder_indices):
+                    folder_indices = np.concatenate([folder_indices, folder_indices[:padding_size]])
+                else:
+                    # np.tile repeats the array n times
+                    folder_indices = np.tile(folder_indices, math.ceil(padding_size / len(folder_indices)))[:padding_size]
+
+            folder_batch_indices = []
             folder_ub_large = math.ceil(len(folder_indices) / self.scaled_batch_size)
 
             # create subsets of the size self.scaled_batch_size, inside these subsets sort audio segments by length
@@ -188,27 +199,20 @@ class DistributedSampler(torch.utils.data.Sampler[T_co]):
                         batch_shuffled_index = torch.randperm(len(batch_indices), generator=generator).tolist()
                         batch_indices = batch_indices[batch_shuffled_index]
 
-                    folder_batches.extend(batch_indices)
+                    folder_batch_indices.extend(batch_indices)
 
-            all_batches.append(folder_batches)
-        return indices
+            all_batch_indices.append(folder_batch_indices)
+
+        if self.drop_last:
+            # remove tail of data to make it evenly divisible,
+            # here it is assumed that len(indices) < self.total_size
+            all_batch_indices = all_batch_indices[:self.total_size]
+
+        assert len(all_batch_indices) == self.total_size
+        return all_batch_indices
 
     def __iter__(self):
         indices = self._get_indices()
-
-        if not self.drop_last:
-            # add extra samples to make it evenly divisible
-            padding_size = self.total_size - len(indices)
-            if padding_size <= len(indices):
-                # now some random elements will be represented twice
-                indices += indices[:padding_size]
-            else:
-                indices += (indices * math.ceil(padding_size / len(indices)))[:padding_size]
-        else:
-            # remove tail of data to make it evenly divisible,
-            # here it is assumed that len(indices) < self.total_size
-            indices = indices[:self.total_size]
-        assert len(indices) == self.total_size
 
         # subsample
         indices = indices[self.rank: self.total_size: self.num_replicas]
