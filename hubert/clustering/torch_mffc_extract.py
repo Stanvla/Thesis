@@ -66,6 +66,7 @@ class ParCzechDataset(Dataset):
     def __len__(self):
         return len(self.df)
 
+
 def clean_data(df, params):
     # thresholds were selected based on the plot
     df = df[(df.type == 'train') | (df.type == 'other')]
@@ -74,7 +75,9 @@ def clean_data(df, params):
     # removed 404.5 hours
     # use only long enough segments
     df = df[df.duration__segments > params['duration__segments_lb']]
+    df = df[df.duration__segments < params['duration__segments_ub']]
     return df
+
 
 class CommonVoiceDataset(Dataset):
     def __init__(self, base_dir, type, resample_rate=16000):

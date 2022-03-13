@@ -10,7 +10,7 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 from torch import optim
 from torchmetrics.functional import accuracy
-from hubert.pretrain_dataset import ParCzechPretrainPL
+from pretrain_dataset import ParCzechPretrainPL
 
 
 class HubertPretrainPL(pl.LightningModule):
@@ -237,6 +237,7 @@ class HubertPretrainPL(pl.LightningModule):
 
     def training_step(self, batch, batch_index, inference=False):
         inputs, wave_lens, targets, indices = batch['waves'], batch['lens'], batch['targets'], batch['idx']
+        # ic(inputs.shape)
         # inputs.shape = [batch, max_wave_len]
         # wave_lens.shape = [batch]
         # targets[k].shape = [batch, n_frames] ... targets is a dict and n_frames << max_wave_len
@@ -249,9 +250,8 @@ class HubertPretrainPL(pl.LightningModule):
         mask_loss, unmask_loss, mask_acc, unmask_acc, total_acc = self._compute_loss_acc(scores, frames_cnt, targets, batch_mask_indices,
                                                                                          batch_masks)
         total_loss = self.mask_loss_weight * mask_loss + (1 - self.mask_loss_weight) * unmask_loss
-        ic(total_loss)
-        ic(mask_loss)
-        ic(unmask_loss)
+        # ic(batch_index)
+        # ic(total_loss)
         return dict(
             loss=total_loss,
             mask_loss=mask_loss.detach(),
@@ -310,19 +310,31 @@ if __name__ == '__main__':
         recognized_sound_coverage__segments_lb=0.45,
         recognized_sound_coverage__segments_ub=0.93,
         duration__segments_lb=0.5,
+        duration__segments_ub=40,
     )
     params = dict(
+        seed=0xDEAD,
+        ignore_index=-1,
+        deterministic=True,
+        # ------------ model params --------------
+        sim=True,
+        mask_weight=1,
+        reduction='mean',
+        softmax_temp=0.1,
+        # ------------ dataset params ------------
         batch_size=2,
         num_workers=0,
+        drop_last=True,
+        batch_scale=10,
         pin_memory=True,
-        ignore_index=-1,
+        # ------------ trainer params ------------
+        n_gpus=2,
         epochs=50,
-        mask_weight=1,
-        softmax_temp=0.1,
-        overfit_batches=2,
-        sim=True,
-        reduction='mean',
-        shuffle=False,
+        stragegy='ddp',
+        accelerator='ddp',
+        fast_dev_run=100,
+        overfit_batches=100,
+        num_processes=None,
     )
 
     ks = [15]
@@ -335,9 +347,12 @@ if __name__ == '__main__':
         num_workers=params['num_workers'],
         num_gpus=torch.cuda.device_count(),
         pin_mem=params['pin_memory'],
-        shuffle=params['shuffle'],
+        shuffle=not params['deterministic'],
         batch_size=params['batch_size'],
-        ignore_index=params['ignore_index']
+        batch_scale=params['batch_scale'],
+        ignore_index=params['ignore_index'],
+        seed=params['seed'],
+        drop_last=params['drop_last'],
     )
     # ............................................... Model .......................................................
     hubert_base_model = torchaudio.models.hubert_base()
@@ -376,12 +391,15 @@ if __name__ == '__main__':
     trainer = pl.Trainer(
         # num_sanity_val_steps=0,
         max_epochs=params['epochs'],
-        deterministic=True,
+        deterministic=params['deterministic'],
         # check_val_every_n_epoch=0,
         # fast_dev_run=10,
-        overfit_batches=params['overfit_batches'],
-        gpus=0,
+        fast_dev_run=params['fast_dev_run'],
+        gpus=params['n_gpus'],
         checkpoint_callback=False,
+        accelerator=params['accelerator'],
+        replace_sampler_ddp=False,
+        # strategy=params['stragegy'],
         # logger=logger
     )
 

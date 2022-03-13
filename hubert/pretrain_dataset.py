@@ -2,7 +2,7 @@
 import math
 import os
 import pickle
-from typing import TypeVar, Optional
+from typing import TypeVar, Optional, Iterable
 import numpy as np
 from icecream import ic
 import pandas as pd
@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from pytorch_lightning.utilities.types import TRAIN_DATALOADERS
 from torch.utils.data import DataLoader
 
-from hubert.clustering.torch_mffc_extract import ParCzechDataset
+from clustering.torch_mffc_extract import ParCzechDataset
 
 T_co = TypeVar('T_co', covariant=True)
 
@@ -36,6 +36,7 @@ class ParCzechPretrain(ParCzechDataset):
         mp3 = self.df.iloc[i].mp3.astype(str)
         mp3_folder = f'{self.mp3_to_int[mp3]}'
         if mp3_folder != self.current_folder:
+            ic(mp3_folder)
             self.get_df_from_folder(mp3_folder)
             self.current_folder = mp3_folder
         segment = self.df.iloc[i].segment_path
@@ -54,14 +55,16 @@ class ParCzechPretrain(ParCzechDataset):
 
     def __getitem__(self, i):
         labels = self.get_labels(i)
+        wave = self.get_wav(self.extract_path(i))
         return dict(
-            wave=self.get_wav(self.extract_path(i)),
+            wave=wave,
             target={k: torch.from_numpy(labels[km].values) for km, k in zip(self.km_labels, self.labels)},
             idx=i,
+            duration=self.df.iloc[i].duration__segments
         )
 
 
-class DistributedSampler(torch.utils.data.Sampler[T_co]):
+class BucketFolderAwareDistributedSampler(Iterable):
     """Sampler that restricts data loading to a subset of the dataset.
 
     It is especially useful in conjunction with `torch.nn.parallel.DistributedDataParallel`.
@@ -106,7 +109,7 @@ class DistributedSampler(torch.utils.data.Sampler[T_co]):
             seed: int = 0,
             drop_last: bool = False,
     ) -> None:
-
+        super(BucketFolderAwareDistributedSampler, self).__init__()
         if num_replicas is None:
             if not dist.is_available():
                 raise RuntimeError("Requires distributed package to be available")
@@ -145,6 +148,10 @@ class DistributedSampler(torch.utils.data.Sampler[T_co]):
         self.shuffle = shuffle
         self.seed = seed
 
+        ic(self.num_replicas)
+        ic(self.rank)
+        ic(self.num_samples)
+        ic(shuffle)
 
     def _get_indices(self):
         generator = torch.Generator()
@@ -162,7 +169,7 @@ class DistributedSampler(torch.utils.data.Sampler[T_co]):
             padding_size = self.total_size - len(self.dataset)
 
         for idx, f in enumerate(folders):
-            folder_durations = dataset.df[dataset.df.folder_int == f].duration__segments
+            folder_durations = self.dataset.df[self.dataset.df.folder_int == f].duration__segments
             folder_indices = folder_durations.index.values
 
             # shuffle the folder_indices
@@ -200,8 +207,7 @@ class DistributedSampler(torch.utils.data.Sampler[T_co]):
                         batch_indices = batch_indices[batch_shuffled_index]
 
                     folder_batch_indices.extend(batch_indices)
-
-            all_batch_indices.append(folder_batch_indices)
+            all_batch_indices.extend(folder_batch_indices)
 
         if self.drop_last:
             # remove tail of data to make it evenly divisible,
@@ -262,7 +268,6 @@ class Collator:
 
         # use only first element from pad_list() since it returns multiple things
         padded_targets = {k: self.pad_list(lst)[0] for k, lst in targets_by_k.items()}
-
         return dict(
             waves=padded_waves,
             lens=wav_lens,
@@ -272,7 +277,22 @@ class Collator:
 
 
 class ParCzechPretrainPL(pl.LightningDataModule):
-    def __init__(self, clean_params, data_path, km_labels, labels_path, num_workers, num_gpus, pin_mem, shuffle, batch_size, ignore_index):
+    def __init__(
+            self,
+            clean_params,
+            data_path,
+            km_labels,
+            labels_path,
+            num_workers,
+            num_gpus,
+            pin_mem,
+            shuffle,
+            batch_size,
+            batch_scale,
+            ignore_index,
+            seed,
+            drop_last
+    ):
         super(ParCzechPretrainPL, self).__init__()
         self.clean_params = clean_params
         self.data_path = data_path
@@ -283,9 +303,11 @@ class ParCzechPretrainPL(pl.LightningDataModule):
         self.pin_mem = pin_mem
         self.shuffle = shuffle
         self.bs = batch_size
+        self.batch_scale = batch_scale
         self.ignore_index = ignore_index
+        self.seed = seed
+        self.drop_last = drop_last
 
-    def setup(self, stage: Optional[str] = None) -> None:
         self.train_data = ParCzechPretrain(
             df_path=self.data_path,
             km_labels=self.km_labels,
@@ -293,19 +315,30 @@ class ParCzechPretrainPL(pl.LightningDataModule):
             label_path=self.labels_path,
             sep=','
         )
+
         self.collate_fn = Collator(self.km_labels, self.ignore_index)
 
-        self.train_loader = DataLoader(
+    def train_dataloader(self) -> TRAIN_DATALOADERS:
+        train_sampler = BucketFolderAwareDistributedSampler(
+            dataset=self.train_data,
+            batch_size=self.bs,
+            batch_scale=self.batch_scale,
+            shuffle=self.shuffle,
+            seed=self.seed,
+            drop_last=self.drop_last,
+        )
+
+        train_loader = DataLoader(
             self.train_data,
             batch_size=self.bs,
             shuffle=self.shuffle,
             collate_fn=self.collate_fn,
-            num_workers=self.num_workers / self.num_gpus if self.num_gpus != 0 else self.num_workers,
-            pin_memory=self.pin_mem
+            num_workers=self.num_workers // self.num_gpus if self.num_gpus != 0 else self.num_workers,
+            pin_memory=self.pin_mem,
+            sampler=train_sampler,
         )
 
-    def train_dataloader(self) -> TRAIN_DATALOADERS:
-        return self.train_loader
+        return train_loader
 
 # %%
 if __name__ == '__main__':
@@ -338,13 +371,13 @@ if __name__ == '__main__':
 
     ks = [15]
 
-    dataset = ParCzechPretrain(
-        df_path,
-        ks,
-        clean_params=parczech_clean_params,
-        label_path=labels_path,
-        sep=',',
-    )
+    # dataset = ParCzechPretrain(
+    #     df_path,
+    #     ks,
+    #     clean_params=parczech_clean_params,
+    #     label_path=labels_path,
+    #     sep=',',
+    # )
 
     # %%
     # %%
