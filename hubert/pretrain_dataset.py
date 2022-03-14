@@ -26,6 +26,7 @@ class ParCzechPretrain(ParCzechDataset):
         with open(os.path.join(self.label_path, 'mp3_to_int.pickle'), 'rb') as f:
             self.mp3_to_int = pickle.load(f)
         self.df['folder_int'] = self.df.mp3.astype(str).map(self.mp3_to_int)
+        self.df.reset_index(drop=True, inplace=True)
         # folder names are numbers starting from 0
         self.current_folder = '-1'
         self.current_targ_df = None
@@ -167,10 +168,13 @@ class BucketFolderAwareDistributedSampler(Iterable):
             if self.shuffle:
                 folder_idx_enlarge = torch.randint(len(folders), (1, ), generator=generator).item()
             padding_size = self.total_size - len(self.dataset)
-
+        ic(self.dataset.df.isnull().values.any())
+        # ic(set(range(self.dataset.df.index.max())) - set(self.dataset.df.index.unique()))
         for idx, f in enumerate(folders):
             folder_durations = self.dataset.df[self.dataset.df.folder_int == f].duration__segments
             folder_indices = folder_durations.index.values
+            # ic(f, len(folder_indices))
+            # ic(any([k > len(self.dataset) for k in folder_indices]), folder_indices.max(), self.dataset.df.index.max(), len(self.dataset))
 
             # shuffle the folder_indices
             if self.shuffle:
@@ -179,13 +183,14 @@ class BucketFolderAwareDistributedSampler(Iterable):
 
             # add extra samples to make dataset evenly divisible
             if idx == folder_idx_enlarge and not self.drop_last:
+                ic(len(folder_indices), padding_size, folder_indices[:padding_size])
                 if padding_size <= len(folder_indices):
                     folder_indices = np.concatenate([folder_indices, folder_indices[:padding_size]])
                 else:
                     # np.tile repeats the array n times
                     folder_indices = np.tile(folder_indices, math.ceil(padding_size / len(folder_indices)))[:padding_size]
+                ic(len(folder_indices), padding_size, folder_indices[:padding_size])
 
-            folder_batch_indices = []
             folder_ub_large = math.ceil(len(folder_indices) / self.scaled_batch_size)
 
             # create subsets of the size self.scaled_batch_size, inside these subsets sort audio segments by length
@@ -200,14 +205,12 @@ class BucketFolderAwareDistributedSampler(Iterable):
                 # divide the subset into batches and shuffle audio segments inside the batch
                 for j in range(ub_batch):
                     batch_indices = subset_indices[j * self.effective_batch_size: min(len(subset_indices), (j + 1) * self.effective_batch_size)]
-
                     # shuffle batch indices, so the batch is not sorted by the length
                     if self.shuffle:
                         batch_shuffled_index = torch.randperm(len(batch_indices), generator=generator).tolist()
                         batch_indices = batch_indices[batch_shuffled_index]
 
-                    folder_batch_indices.extend(batch_indices)
-            all_batch_indices.extend(folder_batch_indices)
+                    all_batch_indices.extend(batch_indices)
 
         if self.drop_last:
             # remove tail of data to make it evenly divisible,
@@ -219,11 +222,9 @@ class BucketFolderAwareDistributedSampler(Iterable):
 
     def __iter__(self):
         indices = self._get_indices()
-
         # subsample
         indices = indices[self.rank: self.total_size: self.num_replicas]
         assert len(indices) == self.num_samples
-
         return iter(indices)
 
     def __len__(self) -> int:

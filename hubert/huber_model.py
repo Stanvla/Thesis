@@ -250,7 +250,7 @@ class HubertPretrainPL(pl.LightningModule):
         mask_loss, unmask_loss, mask_acc, unmask_acc, total_acc = self._compute_loss_acc(scores, frames_cnt, targets, batch_mask_indices,
                                                                                          batch_masks)
         total_loss = self.mask_loss_weight * mask_loss + (1 - self.mask_loss_weight) * unmask_loss
-        # ic(batch_index)
+        ic(batch_index, indices)
         # ic(total_loss)
         return dict(
             loss=total_loss,
@@ -328,13 +328,13 @@ if __name__ == '__main__':
         batch_scale=10,
         pin_memory=True,
         # ------------ trainer params ------------
-        n_gpus=2,
+        n_gpus=0,
         epochs=50,
         stragegy='ddp',
-        accelerator='ddp',
+        accelerator='cpu',
         fast_dev_run=100,
-        overfit_batches=100,
-        num_processes=None,
+        overfit_batches=None,
+        num_processes=1,
     )
 
     ks = [15]
@@ -394,12 +394,13 @@ if __name__ == '__main__':
         deterministic=params['deterministic'],
         # check_val_every_n_epoch=0,
         # fast_dev_run=10,
-        fast_dev_run=params['fast_dev_run'],
         gpus=params['n_gpus'],
+        fast_dev_run=params['fast_dev_run'],
         checkpoint_callback=False,
-        accelerator=params['accelerator'],
         replace_sampler_ddp=False,
-        # strategy=params['stragegy'],
+        accelerator=params['accelerator'],
+        strategy=params['stragegy'],
+        num_processes=params['num_processes'],
         # logger=logger
     )
 
