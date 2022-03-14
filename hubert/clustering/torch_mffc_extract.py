@@ -75,7 +75,9 @@ def clean_data(df, params):
     # removed 404.5 hours
     # use only long enough segments
     df = df[df.duration__segments > params['duration__segments_lb']]
+    ic(df.duration__segments.sum() / 3600)
     df = df[df.duration__segments < params['duration__segments_ub']]
+    ic(df.duration__segments.sum() / 3600)
     return df
 
 

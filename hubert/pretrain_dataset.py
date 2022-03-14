@@ -15,8 +15,6 @@ from torch.utils.data import DataLoader
 
 from clustering.torch_mffc_extract import ParCzechDataset
 
-T_co = TypeVar('T_co', covariant=True)
-
 
 class ParCzechPretrain(ParCzechDataset):
     def __init__(self, df_path, km_labels, resample_rate=16000, clean_params=None, label_path=None, sep='\t'):
@@ -37,7 +35,7 @@ class ParCzechPretrain(ParCzechDataset):
         mp3 = self.df.iloc[i].mp3.astype(str)
         mp3_folder = f'{self.mp3_to_int[mp3]}'
         if mp3_folder != self.current_folder:
-            ic(mp3_folder)
+            # ic(mp3_folder)
             self.get_df_from_folder(mp3_folder)
             self.current_folder = mp3_folder
         segment = self.df.iloc[i].segment_path
@@ -168,13 +166,10 @@ class BucketFolderAwareDistributedSampler(Iterable):
             if self.shuffle:
                 folder_idx_enlarge = torch.randint(len(folders), (1, ), generator=generator).item()
             padding_size = self.total_size - len(self.dataset)
-        ic(self.dataset.df.isnull().values.any())
-        # ic(set(range(self.dataset.df.index.max())) - set(self.dataset.df.index.unique()))
+
         for idx, f in enumerate(folders):
             folder_durations = self.dataset.df[self.dataset.df.folder_int == f].duration__segments
             folder_indices = folder_durations.index.values
-            # ic(f, len(folder_indices))
-            # ic(any([k > len(self.dataset) for k in folder_indices]), folder_indices.max(), self.dataset.df.index.max(), len(self.dataset))
 
             # shuffle the folder_indices
             if self.shuffle:
@@ -182,7 +177,7 @@ class BucketFolderAwareDistributedSampler(Iterable):
                 folder_indices = folder_indices[folder_shuffled_index]
 
             # add extra samples to make dataset evenly divisible
-            if idx == folder_idx_enlarge and not self.drop_last:
+            if idx == folder_idx_enlarge and not self.drop_last and padding_size != 0:
                 ic(len(folder_indices), padding_size, folder_indices[:padding_size])
                 if padding_size <= len(folder_indices):
                     folder_indices = np.concatenate([folder_indices, folder_indices[:padding_size]])
@@ -332,7 +327,6 @@ class ParCzechPretrainPL(pl.LightningDataModule):
         train_loader = DataLoader(
             self.train_data,
             batch_size=self.bs,
-            shuffle=self.shuffle,
             collate_fn=self.collate_fn,
             num_workers=self.num_workers // self.num_gpus if self.num_gpus != 0 else self.num_workers,
             pin_memory=self.pin_mem,
@@ -381,15 +375,4 @@ if __name__ == '__main__':
     # )
 
     # %%
-    # %%
-
-
-
-
-
-
-
-
-
-
     # %%

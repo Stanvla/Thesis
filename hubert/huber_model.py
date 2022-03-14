@@ -1,4 +1,5 @@
 # %%
+import os
 from collections import OrderedDict
 from datetime import datetime
 import pytorch_lightning as pl
@@ -11,6 +12,7 @@ from torch import nn
 from torch import optim
 from torchmetrics.functional import accuracy
 from pretrain_dataset import ParCzechPretrainPL
+import math
 
 
 class HubertPretrainPL(pl.LightningModule):
@@ -21,7 +23,7 @@ class HubertPretrainPL(pl.LightningModule):
                  mask_weight,
                  softmax_temp,
                  betas,
-                 warm_up_steps,
+                 warm_up_perc,
                  total_steps,
                  hubert_features=768,
                  peak_lr=5e-4,
@@ -45,9 +47,9 @@ class HubertPretrainPL(pl.LightningModule):
         self.reduction = reduction
 
         self.betas = betas
-        self.warm_up_steps = warm_up_steps
-        self.lr_inc = peak_lr / warm_up_steps
-        self.lr_dec = peak_lr / (total_steps - warm_up_steps)
+        self.warm_up_steps = math.ceil(total_steps * warm_up_perc)
+        self.lr_inc = peak_lr / self.warm_up_steps
+        self.lr_dec = peak_lr / (total_steps - self.warm_up_steps)
 
         self.mask = torch.tensor(0, device=self.device)
         self.mask_loss_weight = mask_weight
@@ -97,7 +99,7 @@ class HubertPretrainPL(pl.LightningModule):
 
             # create span mask, here we use only row indices
             mask = torch.zeros(features.shape[0], device=self.device, dtype=torch.bool)
-            # for mask indices set True
+            # for masked indices set True
             mask.index_fill_(0, index_mask.to(self.device), True)
             # so where the mask is True we will replace the values
             batch_masks.append(mask)
@@ -151,7 +153,7 @@ class HubertPretrainPL(pl.LightningModule):
 
     def _accuracy(self, seq, trg):
         predicted = seq.argmax(1)
-        return torch.sum(predicted == trg) / seq.shape[0]
+        return torch.sum(predicted == trg)
 
     def _get_loss_acc(self, seq, seq_len, mask, trg):
         # seq.shape = [max_seq_len, k]
@@ -171,9 +173,9 @@ class HubertPretrainPL(pl.LightningModule):
         # cross_entropy recap
         #   The input is expected to contain raw, unnormalized scores for each class.
         #   input has to be a Tensor of size either (minibatch, C).
-        loss = F.cross_entropy(new_seq, new_trg, reduction=self.reduction)
+        loss = F.cross_entropy(new_seq, new_trg, reduction='sum')
         # multiply acc by the number of elements in the sequence
-        acc = accuracy(new_seq, new_trg) * new_seq.shape[0]
+        acc = self._accuracy(new_seq, new_trg)
         return loss, acc, new_seq.shape[0]
 
     def _compute_loss_acc(self, similarity_scores, frames_cnt, targets, batch_mask_indices, batch_masks):
@@ -186,6 +188,7 @@ class HubertPretrainPL(pl.LightningModule):
 
         total_mask_loss, total_unmask_loss = 0, 0
         total_mask_acc, total_unmask_acc, total_acc = 0, 0, 0
+        cnt_mask, cnt_unmask, cnt_total = 0, 0, 0
 
         # iterate over different clustering models
         for k, scores in similarity_scores.items():
@@ -193,13 +196,6 @@ class HubertPretrainPL(pl.LightningModule):
 
             # extract specific target
             k_targets = targets[k]
-
-            batch_size = scores.shape[0]
-
-            # metrics for a specific clustering model k
-            clustering_mask_loss, clustering_unmask_loss = 0, 0
-            clustering_mask_acc, clustering_unmask_acc, clustering_total_acc = 0, 0, 0
-            cnt_mask, cnt_unmask, cnt_total = 0, 0, 0
 
             # iterate over sequences in the batch
             for seq_score, k_target, seq_len, mask in zip(scores, k_targets, frames_cnt, batch_masks):
@@ -210,34 +206,38 @@ class HubertPretrainPL(pl.LightningModule):
 
                 # cross entropy loss and acc over frames without mask
                 unmask_loss, unmask_acc, unmask_size = self._get_loss_acc(seq_score, seq_len, mask, k_target)
-                clustering_unmask_loss += unmask_loss
-                clustering_unmask_acc += unmask_acc
+                total_unmask_loss += unmask_loss
+                total_unmask_acc += unmask_acc
                 cnt_unmask += unmask_size
 
                 # cross entropy loss and acc over frames with mask
                 mask_loss, mask_acc, mask_size = self._get_loss_acc(seq_score, seq_len, ~mask, k_target)
-                clustering_mask_loss += mask_loss
-                clustering_mask_acc += mask_acc
+                total_mask_loss += mask_loss
+                total_mask_acc += mask_acc
                 cnt_mask += mask_size
 
                 # total accuracy
-                clustering_total_acc += accuracy(seq_score[:seq_len], k_target[:seq_len]) * seq_len
+                total_acc += accuracy(seq_score[:seq_len], k_target[:seq_len]) * seq_len
                 cnt_total += seq_len
 
-            # average across batch
-            total_mask_loss += clustering_mask_loss / batch_size
-            total_unmask_loss += clustering_unmask_loss / batch_size
+        total_mask_acc = total_mask_acc / cnt_mask
+        total_unmask_acc = total_unmask_acc / cnt_unmask
+        total_acc = total_acc / (cnt_mask + cnt_unmask)
 
-            total_mask_acc += clustering_mask_acc / cnt_mask
-            total_unmask_acc += clustering_unmask_acc / cnt_unmask
-            total_acc += clustering_total_acc / cnt_total
-        # total_{mask,unmask}_{loss,acc} are sums of losses for different clustering models
-        return total_mask_loss, total_unmask_loss, total_mask_acc / len(similarity_scores), total_unmask_acc / len(similarity_scores), total_acc / len(
-            similarity_scores)
+        if self.reduction == 'mean':
+            total_mask_loss = total_mask_loss / cnt_mask
+            total_unmask_loss = total_unmask_loss / cnt_unmask
+        elif self.reduction == 'sum':
+            batch_size = frames_cnt.shape[0]
+            total_mask_loss = total_mask_loss / batch_size
+            total_unmask_loss = total_unmask_loss / batch_size
+        else:
+            raise RuntimeError(f'{self.reduction} can be ["sum", "mean"]')
+
+        return total_mask_loss, total_unmask_loss, total_mask_acc, total_unmask_acc, total_acc
 
     def training_step(self, batch, batch_index, inference=False):
         inputs, wave_lens, targets, indices = batch['waves'], batch['lens'], batch['targets'], batch['idx']
-        # ic(inputs.shape)
         # inputs.shape = [batch, max_wave_len]
         # wave_lens.shape = [batch]
         # targets[k].shape = [batch, n_frames] ... targets is a dict and n_frames << max_wave_len
@@ -250,8 +250,6 @@ class HubertPretrainPL(pl.LightningModule):
         mask_loss, unmask_loss, mask_acc, unmask_acc, total_acc = self._compute_loss_acc(scores, frames_cnt, targets, batch_mask_indices,
                                                                                          batch_masks)
         total_loss = self.mask_loss_weight * mask_loss + (1 - self.mask_loss_weight) * unmask_loss
-        ic(batch_index, indices)
-        # ic(total_loss)
         return dict(
             loss=total_loss,
             mask_loss=mask_loss.detach(),
@@ -266,37 +264,36 @@ class HubertPretrainPL(pl.LightningModule):
     #     return self.training_step(batch, batch_index, inference=True)
 
     def configure_optimizers(self):
-        # optimizer = optim.Adam(self.parameters(), lr=0.001, betas=self.betas)
-        optimizer = optim.Adam(self.parameters(), lr=0.001)
+        optimizer = optim.Adam(self.parameters(), lr=0, betas=self.betas)
+        # optimizer = optim.Adam(self.parameters(), lr=0.001)
         return dict(optimizer=optimizer)
 
-    # def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx=0, optimizer_closure=None, on_tpu=False, using_native_amp=False, using_lbfgs=False):
-    #     if self.trainer.global_step < self.warm_up_steps:
-    #         lr_scale = self.lr_inc
-    #     else:
-    #         lr_scale = - self.lr_dec
-    #
-    #     for pg in optimizer.param_groups:
-    #         pg['lr'] += lr_scale
-    #
-    #     optimizer.step(closure=optimizer_closure)
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx=0, optimizer_closure=None, on_tpu=False, using_native_amp=False, using_lbfgs=False):
+        ic(self.trainer.use_amp())
+        for pg in optimizer.param_groups:
+            if self.trainer.global_step < self.warm_up_steps:
+                pg['lr'] += self.lr_inc
+            else:
+                pg['lr'] -= self.lr_dec
+        optimizer.step(closure=optimizer_closure)
 
-    # def training_epoch_end(self, outputs):
-    #     total_loss = sum(out['loss'] for out in outputs) / len(outputs)
-    #     masked_loss = sum(out['mask_loss'] for out in outputs) / len(outputs)
-    #     unmasked_loss = sum(out['unmask_loss'] for out in outputs) / len(outputs)
-    #
-    #     total_acc = sum(out['total_acc'] for out in outputs) / len(outputs)
-    #     masked_acc = sum(out['mask_acc'] for out in outputs) / len(outputs)
-    #     unmasked_acc = sum(out['unmask_acc'] for out in outputs) / len(outputs)
-    #
-    #     self.logger.experiment.add_scalar(f'Loss/Total', total_loss, self.current_epoch)
-    #     self.logger.experiment.add_scalar(f'Loss/Masked', masked_loss, self.current_epoch)
-    #     self.logger.experiment.add_scalar(f'Loss/Unmasked', unmasked_loss, self.current_epoch)
-    #
-    #     self.logger.experiment.add_scalar(f'Acc/Total', total_acc, self.current_epoch)
-    #     self.logger.experiment.add_scalar(f'Acc/Masked', masked_acc, self.current_epoch)
-    #     self.logger.experiment.add_scalar(f'Acc/Unmasked', unmasked_acc, self.current_epoch)
+    def training_epoch_end(self, outputs):
+        total_loss = sum(out['loss'] for out in outputs) / len(outputs)
+        masked_loss = sum(out['mask_loss'] for out in outputs) / len(outputs)
+        unmasked_loss = sum(out['unmask_loss'] for out in outputs) / len(outputs)
+
+        total_acc = sum(out['total_acc'] for out in outputs) / len(outputs)
+        masked_acc = sum(out['mask_acc'] for out in outputs) / len(outputs)
+        unmasked_acc = sum(out['unmask_acc'] for out in outputs) / len(outputs)
+        ic(total_loss, masked_loss, unmasked_loss, total_acc, masked_acc, unmasked_acc)
+
+        self.logger.experiment.add_scalar(f'Loss/Total', total_loss, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Loss/Masked', masked_loss, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Loss/Unmasked', unmasked_loss, self.current_epoch)
+        x=10
+        self.logger.experiment.add_scalar(f'Acc/Total', total_acc, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Acc/Masked', masked_acc, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Acc/Unmasked', unmasked_acc, self.current_epoch)
 
 
 # %%
@@ -310,7 +307,7 @@ if __name__ == '__main__':
         recognized_sound_coverage__segments_lb=0.45,
         recognized_sound_coverage__segments_ub=0.93,
         duration__segments_lb=0.5,
-        duration__segments_ub=40,
+        duration__segments_ub=20,
     )
     params = dict(
         seed=0xDEAD,
@@ -320,22 +317,31 @@ if __name__ == '__main__':
         sim=True,
         mask_weight=1,
         reduction='mean',
-        softmax_temp=0.1,
+        softmax_temp=0.01,
+        p=0.08,
+        l=10,
+        peak_lr=1e-4,
+        hubert_features=768,
+        betas=(0.9, 0.98),
+        proj_dim=256,
+        warm_up=0.1,
         # ------------ dataset params ------------
-        batch_size=2,
-        num_workers=0,
-        drop_last=True,
+        batch_size=4,
+        num_workers=8,
+        drop_last=False,
         batch_scale=10,
         pin_memory=True,
         # ------------ trainer params ------------
-        n_gpus=0,
+        n_gpus=torch.cuda.device_count(),
         epochs=50,
         stragegy='ddp',
-        accelerator='cpu',
-        fast_dev_run=100,
+        accelerator='gpu',
+        fast_dev_run=False,
         overfit_batches=None,
         num_processes=1,
+        limit_train_batches=2000,
     )
+    params['num_workers'] = params['num_workers'] * params['n_gpus']
 
     ks = [15]
     # ............................................... Dataset .......................................................
@@ -345,7 +351,7 @@ if __name__ == '__main__':
         km_labels=ks,
         labels_path=labels_path,
         num_workers=params['num_workers'],
-        num_gpus=torch.cuda.device_count(),
+        num_gpus=params['n_gpus'],
         pin_mem=params['pin_memory'],
         shuffle=not params['deterministic'],
         batch_size=params['batch_size'],
@@ -356,22 +362,26 @@ if __name__ == '__main__':
     )
     # ............................................... Model .......................................................
     hubert_base_model = torchaudio.models.hubert_base()
+
     hubert_pretrain = HubertPretrainPL(
         hubert_base_model,
         cluster_sizes=ks,
-        proj_dim=256,
+        sim=params['sim'],
+        proj_dim=params['proj_dim'],
+        reduction=params['reduction'],
+        hubert_features=params['hubert_features'],
+
+        warm_up_perc=params['warm_up'],
+        total_steps=params['limit_train_batches'] * params['epochs'],
+        betas=params['betas'],
+        peak_lr=params['peak_lr'],
+
+        p=params['p'],
+        l=params['l'],
         mask_weight=params['mask_weight'],
         softmax_temp=params['softmax_temp'],
-        betas=(0.9, 0.98),
-        warm_up_steps=100,
-        total_steps=500,
-        hubert_features=768,
-        peak_lr=5e-4,
-        p=0.08,
-        l=10,
+
         ignore_index=params['ignore_index'],
-        sim=params['sim'],
-        reduction=params['reduction']
     )
 
     # ............................................... Training .......................................................
@@ -396,13 +406,16 @@ if __name__ == '__main__':
         # fast_dev_run=10,
         gpus=params['n_gpus'],
         fast_dev_run=params['fast_dev_run'],
-        checkpoint_callback=False,
+        enable_checkpointing=False,
         replace_sampler_ddp=False,
         accelerator=params['accelerator'],
         strategy=params['stragegy'],
         num_processes=params['num_processes'],
-        # logger=logger
+        limit_train_batches=params['limit_train_batches'],
+        logger=logger,
+        # precision=16,
     )
+
 
     trainer.fit(hubert_pretrain, dataset)
     # %%
