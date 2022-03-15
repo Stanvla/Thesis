@@ -24,7 +24,7 @@ class HubertPretrainPL(pl.LightningModule):
                  softmax_temp,
                  betas,
                  warm_up_perc,
-                 total_steps,
+                 epochs,
                  hubert_features=768,
                  peak_lr=5e-4,
                  p=0.08,
@@ -47,9 +47,9 @@ class HubertPretrainPL(pl.LightningModule):
         self.reduction = reduction
 
         self.betas = betas
-        self.warm_up_steps = math.ceil(total_steps * warm_up_perc)
-        self.lr_inc = peak_lr / self.warm_up_steps
-        self.lr_dec = peak_lr / (total_steps - self.warm_up_steps)
+        self.epochs = epochs
+        self.lr = peak_lr
+        self.warm_up_epochs = math.ceil(epochs * warm_up_perc)
 
         self.mask = torch.tensor(0, device=self.device)
         self.mask_loss_weight = mask_weight
@@ -264,18 +264,17 @@ class HubertPretrainPL(pl.LightningModule):
     #     return self.training_step(batch, batch_index, inference=True)
 
     def configure_optimizers(self):
-        optimizer = optim.Adam(self.parameters(), lr=0, betas=self.betas)
-        # optimizer = optim.Adam(self.parameters(), lr=0.001)
-        return dict(optimizer=optimizer)
-
-    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx=0, optimizer_closure=None, on_tpu=False, using_native_amp=False, using_lbfgs=False):
-        ic(self.trainer.use_amp())
-        for pg in optimizer.param_groups:
-            if self.trainer.global_step < self.warm_up_steps:
-                pg['lr'] += self.lr_inc
+        def lr_scheduler(cur_epoch):
+            if cur_epoch < self.warm_up_epochs:
+                scalar = cur_epoch / self.warm_up_epochs
             else:
-                pg['lr'] -= self.lr_dec
-        optimizer.step(closure=optimizer_closure)
+                scalar = (self.epochs - cur_epoch)/(self.epochs - self.warm_up_epochs)
+            assert scalar >= 0
+            return float(scalar)
+
+        optimizer = optim.Adam(self.parameters(), lr=self.lr, betas=self.betas)
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_scheduler)
+        return dict(optimizer=optimizer, lr_scheduler=scheduler)
 
     def training_epoch_end(self, outputs):
         total_loss = sum(out['loss'] for out in outputs) / len(outputs)
@@ -339,7 +338,7 @@ if __name__ == '__main__':
         fast_dev_run=False,
         overfit_batches=None,
         num_processes=1,
-        limit_train_batches=2000,
+        limit_train_batches=300,
     )
     params['num_workers'] = params['num_workers'] * params['n_gpus']
 
@@ -372,7 +371,7 @@ if __name__ == '__main__':
         hubert_features=params['hubert_features'],
 
         warm_up_perc=params['warm_up'],
-        total_steps=params['limit_train_batches'] * params['epochs'],
+        epochs=params['epochs'],
         betas=params['betas'],
         peak_lr=params['peak_lr'],
 
@@ -413,7 +412,7 @@ if __name__ == '__main__':
         num_processes=params['num_processes'],
         limit_train_batches=params['limit_train_batches'],
         logger=logger,
-        # precision=16,
+        precision=32,
     )
 
 
