@@ -2,15 +2,16 @@
 import math
 import os
 import pickle
-from typing import TypeVar, Optional, Iterable
+from typing import Optional, Iterable
+
 import numpy as np
-from icecream import ic
 import pandas as pd
 import pytorch_lightning as pl
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from pytorch_lightning.utilities.types import TRAIN_DATALOADERS
+from icecream import ic
+from pytorch_lightning.utilities.types import TRAIN_DATALOADERS, EVAL_DATALOADERS
 from torch.utils.data import DataLoader
 
 from clustering.torch_mffc_extract import ParCzechDataset
@@ -31,6 +32,19 @@ class ParCzechPretrain(ParCzechDataset):
         self.km_labels = [f'km{k}' for k in km_labels]
         self.labels = km_labels
 
+    def set_folders_in_list(self, folder_list):
+        print(f'using folders {folder_list}')
+        self.df = self.df[self.df['folder_int'].isin(folder_list)]
+        self.df.reset_index(drop=True, inplace=True)
+
+    def set_folders_not_in_list(self, folder_list):
+        print(f'excluding folders {folder_list}')
+        self.df = self.df[~self.df['folder_int'].isin(folder_list)]
+        self.df.reset_index(drop=True, inplace=True)
+
+    def get_folders(self):
+        return sorted(list(set(self.mp3_to_int.values())))
+
     def get_labels(self, i):
         mp3 = self.df.iloc[i].mp3.astype(str)
         mp3_folder = f'{self.mp3_to_int[mp3]}'
@@ -38,8 +52,10 @@ class ParCzechPretrain(ParCzechDataset):
             # ic(mp3_folder)
             self.get_df_from_folder(mp3_folder)
             self.current_folder = mp3_folder
+        # get segment name in form `mp3/segm_index`
         segment = self.df.iloc[i].segment_path
         segment = '/'.join(segment.split('/')[-2:])
+
         result_df = self.current_targ_df[self.current_targ_df.segm == segment].sort_values(by=['id'])
         return result_df
 
@@ -51,6 +67,7 @@ class ParCzechPretrain(ParCzechDataset):
                 dfs.append(pd.read_csv(os.path.join(self.label_path, folder_path, f)))
         self.current_targ_df = pd.concat(dfs).drop(columns=['mp3'])
         self.current_targ_df['id'] = self.current_targ_df.path.str.split('/').str[-1].astype(int)
+        self.current_targ_df.drop(columns=['path'], inplace=True)
 
     def __getitem__(self, i):
         labels = self.get_labels(i)
@@ -164,7 +181,7 @@ class BucketFolderAwareDistributedSampler(Iterable):
         if not self.drop_last:
             # get folder index that will be enlarged
             if self.shuffle:
-                folder_idx_enlarge = torch.randint(len(folders), (1, ), generator=generator).item()
+                folder_idx_enlarge = torch.randint(len(folders), (1,), generator=generator).item()
             padding_size = self.total_size - len(self.dataset)
 
         for idx, f in enumerate(folders):
@@ -187,7 +204,6 @@ class BucketFolderAwareDistributedSampler(Iterable):
                 ic(len(folder_indices), padding_size, folder_indices[:padding_size])
 
             folder_ub_large = math.ceil(len(folder_indices) / self.scaled_batch_size)
-
             # create subsets of the size self.scaled_batch_size, inside these subsets sort audio segments by length
             for i in range(folder_ub_large):
                 # the subset will be sorted by duration
@@ -287,7 +303,8 @@ class ParCzechPretrainPL(pl.LightningDataModule):
             batch_scale,
             ignore_index,
             seed,
-            drop_last
+            drop_last,
+            val_frac,
     ):
         super(ParCzechPretrainPL, self).__init__()
         self.clean_params = clean_params
@@ -311,8 +328,30 @@ class ParCzechPretrainPL(pl.LightningDataModule):
             label_path=self.labels_path,
             sep=','
         )
+        self.val_data = ParCzechPretrain(
+            df_path=self.data_path,
+            km_labels=self.km_labels,
+            clean_params=self.clean_params,
+            label_path=self.labels_path,
+            sep=','
+        )
+        folders = self.train_data.get_folders()
+        val_folders_cnt = min(1, math.floor(len(folders) * val_frac))
+        val_folders = folders[:val_folders_cnt]
 
+        self.val_data.set_folders_in_list(val_folders)
+        self.train_data.set_folders_not_in_list(val_folders)
         self.collate_fn = Collator(self.km_labels, self.ignore_index)
+
+    def _get_loader(self, data, sampler):
+        return DataLoader(
+            data,
+            batch_size=self.bs,
+            collate_fn=self.collate_fn,
+            num_workers=self.num_workers // self.num_gpus if self.num_gpus != 0 else self.num_workers,
+            pin_memory=self.pin_mem,
+            sampler=sampler,
+        )
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
         train_sampler = BucketFolderAwareDistributedSampler(
@@ -323,17 +362,20 @@ class ParCzechPretrainPL(pl.LightningDataModule):
             seed=self.seed,
             drop_last=self.drop_last,
         )
+        return self._get_loader(self.train_data, train_sampler)
 
-        train_loader = DataLoader(
-            self.train_data,
+    def val_dataloader(self) -> EVAL_DATALOADERS:
+        val_sampler = BucketFolderAwareDistributedSampler(
+            dataset=self.val_data,
             batch_size=self.bs,
-            collate_fn=self.collate_fn,
-            num_workers=self.num_workers // self.num_gpus if self.num_gpus != 0 else self.num_workers,
-            pin_memory=self.pin_mem,
-            sampler=train_sampler,
+            batch_scale=self.batch_scale,
+            shuffle=False,
+            seed=self.seed,
+            drop_last=self.drop_last,
         )
+        val_loader = self._get_loader(self.val_data, val_sampler)
+        return val_loader
 
-        return train_loader
 
 # %%
 if __name__ == '__main__':

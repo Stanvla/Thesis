@@ -7,12 +7,14 @@ import torch
 import torch.nn.functional as F
 import torchaudio
 from icecream import ic
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 from torch import optim
 from torchmetrics.functional import accuracy
 from pretrain_dataset import ParCzechPretrainPL
 import math
+import pickle
 
 
 class HubertPretrainPL(pl.LightningModule):
@@ -335,12 +337,19 @@ def get_logging_dir_name(parameters, clusters):
         batch_size='bs',
         # ------------ trainer params ------------
         epochs='ep',
-        fast_dev_run='cnt',
-        limit_train_batches='cnt',
     )
-    if parameters['limit_train_batches'] == 1.0 and not parameters['fast_dev_run']:
-        raise RuntimeError(f'One of the [limit_train_batches, fast_dev_run] should be unspecified')
+    if parameters['limit_train_batches'] == 1.0 and not parameters['fast_dev_run'] or \
+            parameters['limit_train_batches'] != 1.0 and parameters['fast_dev_run']:
+        raise RuntimeError(f'Just one of the [limit_train_batches, fast_dev_run] should be unspecified')
+
     result = [f'ks=' + '_'.join(list(map(str, clusters)))]
+
+    if parameters['limit_train_batches'] != 1.0:
+        result.append(f'cnt={parameters["limit_train_batches"]}')
+
+    if parameters['fast_dev_run']:
+        result.append(f'cnt={parameters["fast_dev_run"]}')
+
     for key, name in naming.items():
         if isinstance(parameters[key], float):
             result.append(f'{name}={parameters[key]:.2f}')
@@ -384,6 +393,7 @@ if __name__ == '__main__':
         drop_last=False,
         batch_scale=10,
         pin_memory=True,
+        val_fraction=0.1,
         # ------------ trainer params ------------
         n_gpus=torch.cuda.device_count(),
         epochs=50,
@@ -392,12 +402,14 @@ if __name__ == '__main__':
         fast_dev_run=False,
         overfit_batches=None,
         num_processes=1,
-        limit_train_batches=2000,
+        limit_train_batches=200,
+        limit_val_batches=100,
     )
     params['num_workers'] = params['num_workers'] * params['n_gpus']
 
     ks = [15, 25, 100]
     # ............................................... Dataset .......................................................
+
     dataset = ParCzechPretrainPL(
         clean_params=parczech_clean_params,
         data_path=df_path,
@@ -412,6 +424,7 @@ if __name__ == '__main__':
         ignore_index=params['ignore_index'],
         seed=params['seed'],
         drop_last=params['drop_last'],
+        val_frac=params['val_fraction'],
     )
     # ............................................... Model .......................................................
     hubert_base_model = torchaudio.models.hubert_base()
@@ -440,7 +453,23 @@ if __name__ == '__main__':
     # ............................................... Training .......................................................
     # Logs are saved to os.path.join(save_dir, name, version)
     # save_dir/name/sub_dir/version
-    logger = TensorBoardLogger(save_dir='logs', name=get_logging_dir_name(params, ks))
+    logging_dir = get_logging_dir_name(params, ks)
+    logger = TensorBoardLogger(save_dir='logs', name=logging_dir)
+
+    # save based on valid loss and valid acc
+    # loss_checkpoint_callback = ModelCheckpoint(
+    #     monitor="val_loss",
+    #     dirpath=os.path.join(logging_dir, 'checkpoints'),
+    #     filename='{epoch:02d}--{val_loss:.2f}',
+    #     mode='min'
+    # )
+    # acc_checkpoint_callback = ModelCheckpoint(
+    #     monitor="val_acc",
+    #     dirpath=os.path.join(logging_dir, 'checkpoints'),
+    #     filename='{epoch:02d}--{val_acc:.2f}',
+    #     mode='max'
+    # )
+    # cb = [loss_checkpoint_callback, acc_checkpoint_callback]
 
     trainer = pl.Trainer(
         # num_sanity_val_steps=0,
@@ -456,8 +485,10 @@ if __name__ == '__main__':
         strategy=params['stragegy'],
         num_processes=params['num_processes'],
         limit_train_batches=params['limit_train_batches'],
+        limit_val_batches=params['limit_val_batches'],
         logger=logger,
         precision=16,
+        # callbacks=cb,
     )
 
 
