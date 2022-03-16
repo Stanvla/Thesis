@@ -86,7 +86,6 @@ class HubertPretrainPL(pl.LightningModule):
 
         batch_mask_indices = []
         batch_masks = []
-        torch.manual_seed(0)
         # iterate over each sequence in the batch and generate mask
         for i, (features, length) in enumerate(zip(feature_batch, frames_cnt)):
             masked_cnt = int(length * self.p)
@@ -106,19 +105,17 @@ class HubertPretrainPL(pl.LightningModule):
 
         batch_masks = torch.stack(batch_masks)
         masked_batch = feature_batch.masked_fill(batch_masks.unsqueeze(-1), self.mask)
-        return masked_batch, batch_mask_indices, batch_masks
+        return masked_batch, batch_masks
 
-    def forward(self, inputs, wave_lens, inference=True):
+    def forward(self, inputs, wave_lens):
         # inputs.shape = [batch, max_wave_len]
         # wave_lens.shape = [batch]
 
         features_batch, frames_cnt = self.hubert_model.feature_extractor(inputs, wave_lens)
-        batch_mask_indices, batch_masks = None, None
-        if not inference:
-            features_batch, batch_mask_indices, batch_masks = self._mask_span(features_batch, frames_cnt)
+        features_batch, batch_masks = self._mask_span(features_batch, frames_cnt)
 
         encoder_features = self.hubert_model.encoder(features_batch, frames_cnt)
-        return encoder_features, frames_cnt, batch_mask_indices, batch_masks
+        return encoder_features, frames_cnt, batch_masks
 
     def _compute_cos_sim(self, encoder_features):
         if not self.sim:
@@ -178,7 +175,7 @@ class HubertPretrainPL(pl.LightningModule):
         acc = self._accuracy(new_seq, new_trg)
         return loss, acc, new_seq.shape[0]
 
-    def _compute_loss_acc(self, similarity_scores, frames_cnt, targets, batch_mask_indices, batch_masks):
+    def _compute_loss_acc(self, similarity_scores, frames_cnt, targets, batch_masks):
         # similarity_scores[k].shape = [batch, n_frames, k]  (similarity_scores is a dict)
         # frames_cnt.shape = [batch]
         # targets[k].shape = [batch, n_frames]  (targets is a dict)
@@ -236,32 +233,42 @@ class HubertPretrainPL(pl.LightningModule):
 
         return total_mask_loss, total_unmask_loss, total_mask_acc, total_unmask_acc, total_acc
 
-    def training_step(self, batch, batch_index, inference=False):
+    def _perform_step(self, batch):
         inputs, wave_lens, targets, indices = batch['waves'], batch['lens'], batch['targets'], batch['idx']
         # inputs.shape = [batch, max_wave_len]
         # wave_lens.shape = [batch]
         # targets[k].shape = [batch, n_frames] ... targets is a dict and n_frames << max_wave_len
 
-        encoder_features, frames_cnt, batch_mask_indices, batch_masks = self(inputs, wave_lens, inference=inference)
+        encoder_features, frames_cnt, batch_masks = self(inputs, wave_lens)
         # encoder_features.shape = [batch, max_seq_len, hubert_features]
         scores = self._compute_cos_sim(encoder_features)
         # scores[k].shape = [batch, n_frames, k]
 
-        mask_loss, unmask_loss, mask_acc, unmask_acc, total_acc = self._compute_loss_acc(scores, frames_cnt, targets, batch_mask_indices,
-                                                                                         batch_masks)
+        mask_loss, unmask_loss, mask_acc, unmask_acc, total_acc = self._compute_loss_acc(scores, frames_cnt, targets, batch_masks)
         total_loss = self.mask_loss_weight * mask_loss + (1 - self.mask_loss_weight) * unmask_loss
+        return total_loss, mask_loss.detach(), unmask_loss.detach(), total_acc.detach(), mask_acc.detach(), unmask_acc.detach()
+
+    def training_step(self, batch, batch_index):
+        total_loss, mask_loss, unmask_loss, total_acc, mask_acc, unmask_acc = self._perform_step(batch)
         return dict(
             loss=total_loss,
-            mask_loss=mask_loss.detach(),
-            unmask_loss=unmask_loss.detach(),
+            mask_loss=mask_loss,
+            unmask_loss=unmask_loss,
             mask_acc=mask_acc,
             unmask_acc=unmask_acc,
             total_acc=total_acc,
-            batch_size=inputs.shape[0]
         )
 
-    # def validation_step(self, batch, batch_index):
-    #     return self.training_step(batch, batch_index, inference=True)
+    def validation_step(self, batch, batch_index):
+        total_loss, mask_loss, unmask_loss, total_acc, mask_acc, unmask_acc = self._perform_step(batch)
+        return dict(
+            loss=total_loss,
+            mask_loss=mask_loss,
+            unmask_loss=unmask_loss,
+            mask_acc=mask_acc,
+            unmask_acc=unmask_acc,
+            total_acc=total_acc,
+        )
 
     def configure_optimizers(self):
         def lr_scheduler(cur_epoch):
@@ -276,23 +283,70 @@ class HubertPretrainPL(pl.LightningModule):
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_scheduler)
         return dict(optimizer=optimizer, lr_scheduler=scheduler)
 
-    def training_epoch_end(self, outputs):
+    def _epoch_end(self, outputs, name):
         total_loss = sum(out['loss'] for out in outputs) / len(outputs)
         masked_loss = sum(out['mask_loss'] for out in outputs) / len(outputs)
         unmasked_loss = sum(out['unmask_loss'] for out in outputs) / len(outputs)
+        total_loss = self.all_gather(total_loss)
+        masked_loss = self.all_gather(masked_loss)
+        unmasked_loss = self.all_gather(unmasked_loss)
 
         total_acc = sum(out['total_acc'] for out in outputs) / len(outputs)
         masked_acc = sum(out['mask_acc'] for out in outputs) / len(outputs)
         unmasked_acc = sum(out['unmask_acc'] for out in outputs) / len(outputs)
-        ic(total_loss, masked_loss, unmasked_loss, total_acc, masked_acc, unmasked_acc)
+        total_acc = self.all_gather(total_acc)
+        masked_acc = self.all_gather(masked_acc)
+        unmasked_acc = self.all_gather(unmasked_acc)
 
-        self.logger.experiment.add_scalar(f'Loss/Total', total_loss, self.current_epoch)
-        self.logger.experiment.add_scalar(f'Loss/Masked', masked_loss, self.current_epoch)
-        self.logger.experiment.add_scalar(f'Loss/Unmasked', unmasked_loss, self.current_epoch)
-        x=10
-        self.logger.experiment.add_scalar(f'Acc/Total', total_acc, self.current_epoch)
-        self.logger.experiment.add_scalar(f'Acc/Masked', masked_acc, self.current_epoch)
-        self.logger.experiment.add_scalar(f'Acc/Unmasked', unmasked_acc, self.current_epoch)
+        # ic(total_loss, masked_loss, unmasked_loss, total_acc, masked_acc, unmasked_acc)
+
+        self.logger.experiment.add_scalar(f'Loss Total/{name}', total_loss, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Loss Masked/{name}', masked_loss, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Loss Unmasked/{name}', unmasked_loss, self.current_epoch)
+
+        self.logger.experiment.add_scalar(f'Acc Total/{name}', total_acc, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Acc Masked/{name}', masked_acc, self.current_epoch)
+        self.logger.experiment.add_scalar(f'Acc Unmasked/{name}', unmasked_acc, self.current_epoch)
+        return total_loss, masked_loss, unmasked_loss, total_acc, masked_acc, unmasked_acc
+
+    def training_epoch_end(self, outputs):
+        _ = self._epoch_end(outputs, 'Train')
+
+    def validation_epoch_end(self, outputs):
+        total_loss, masked_loss, _, total_acc, masked_acc, _ = self._epoch_end(outputs, 'Val')
+        self.log('val_total_loss', total_loss, logger=False, sync_dist=True)
+        self.log('val_masked_loss', masked_loss, logger=False, sync_dist=True)
+
+        self.log('val_total_acc', total_acc, logger=False, sync_dist=True)
+        self.log('val_masked_acc', masked_acc, logger=False, sync_dist=True)
+
+
+def get_logging_dir_name(parameters, clusters):
+    naming = dict(
+        deterministic='det',
+        # ------------ model params --------------
+        sim='sim',
+        mask_weight='mw',
+        reduction='red',
+        softmax_temp='st',
+        peak_lr='lr',
+        warm_up='wu',
+        # ------------ dataset params ------------
+        batch_size='bs',
+        # ------------ trainer params ------------
+        epochs='ep',
+        fast_dev_run='cnt',
+        limit_train_batches='cnt',
+    )
+    if parameters['limit_train_batches'] == 1.0 and not parameters['fast_dev_run']:
+        raise RuntimeError(f'One of the [limit_train_batches, fast_dev_run] should be unspecified')
+    result = [f'ks=' + '_'.join(list(map(str, clusters)))]
+    for key, name in naming.items():
+        if isinstance(parameters[key], float):
+            result.append(f'{name}={parameters[key]:.2f}')
+        else:
+            result.append(f'{name}={parameters[key]}')
+    return '_'.join(result) + '__' + datetime.now().strftime('%d.%m__%H.%M')
 
 
 # %%
@@ -311,7 +365,7 @@ if __name__ == '__main__':
     params = dict(
         seed=0xDEAD,
         ignore_index=-1,
-        deterministic=True,
+        deterministic=False,
         # ------------ model params --------------
         sim=True,
         mask_weight=1,
@@ -338,11 +392,11 @@ if __name__ == '__main__':
         fast_dev_run=False,
         overfit_batches=None,
         num_processes=1,
-        limit_train_batches=300,
+        limit_train_batches=2000,
     )
     params['num_workers'] = params['num_workers'] * params['n_gpus']
 
-    ks = [15]
+    ks = [15, 25, 100]
     # ............................................... Dataset .......................................................
     dataset = ParCzechPretrainPL(
         clean_params=parczech_clean_params,
@@ -386,16 +440,7 @@ if __name__ == '__main__':
     # ............................................... Training .......................................................
     # Logs are saved to os.path.join(save_dir, name, version)
     # save_dir/name/sub_dir/version
-    logger = TensorBoardLogger(
-        save_dir='logs',
-        name=f'clusters={"_".join(list(map(str, ks)))}_'
-             f'mw={params["mask_weight"]:.2f}_'
-             f'st={params["softmax_temp"]:.2f}_'
-             f'overfit={params["overfit_batches"]}_'
-             f'sim=f{params["sim"]}'
-             f'_red={params["reduction"]}_'
-             + '_' + datetime.now().strftime('%d.%m__%H.%M'),
-    )
+    logger = TensorBoardLogger(save_dir='logs', name=get_logging_dir_name(params, ks))
 
     trainer = pl.Trainer(
         # num_sanity_val_steps=0,
@@ -412,7 +457,7 @@ if __name__ == '__main__':
         num_processes=params['num_processes'],
         limit_train_batches=params['limit_train_batches'],
         logger=logger,
-        precision=32,
+        precision=16,
     )
 
 
