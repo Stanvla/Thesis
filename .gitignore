@@ -5,6 +5,7 @@
 *.wav
 .ipynb_checkpoints/
 *.history-stankov
+*.ckpt
 
 
 
