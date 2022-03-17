@@ -12,6 +12,8 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 from torch import optim
 from torchmetrics.functional import accuracy
+
+from hubert.filter_dataframe import FilterLB, FilterUB
 from pretrain_dataset import ParCzechPretrainPL
 import math
 import pickle
@@ -236,7 +238,7 @@ class HubertPretrainPL(pl.LightningModule):
         return total_mask_loss, total_unmask_loss, total_mask_acc, total_unmask_acc, total_acc
 
     def _perform_step(self, batch):
-        inputs, wave_lens, targets, indices = batch['waves'], batch['lens'], batch['targets'], batch['idx']
+        inputs, wave_lens, targets = batch['waves'], batch['lens'], batch['targets']
         # inputs.shape = [batch, max_wave_len]
         # wave_lens.shape = [batch]
         # targets[k].shape = [batch, n_frames] ... targets is a dict and n_frames << max_wave_len
@@ -364,12 +366,13 @@ if __name__ == '__main__':
     # ............................................... Parameters .......................................................
     df_path = '/lnet/express/work/people/stankov/alignment/subset/subset.csv'
     labels_path = '/lnet/express/work/people/stankov/alignment/clustering_all/segments'
-    parczech_clean_params = dict(
-        recognized_sound_coverage__segments_lb=0.45,
-        recognized_sound_coverage__segments_ub=0.93,
-        duration__segments_lb=0.5,
-        duration__segments_ub=20,
-    )
+    parczech_filters = [
+        FilterLB(value=0.45, name='recognized_sound_coverage__segments'),
+        FilterUB(value=0.93, name='recognized_sound_coverage__segments'),
+        FilterLB(value=0.5, name='duration__segments'),
+        FilterUB(value=20, name='duration__segments'),
+    ]
+
     params = dict(
         seed=0xDEAD,
         ignore_index=-1,

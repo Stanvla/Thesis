@@ -13,11 +13,16 @@ import torchaudio
 from icecream import ic
 from torch.utils.data import Dataset, DataLoader
 
+from hubert.filter_dataframe import clean_data_parczech
+
 
 class ParCzechDataset(Dataset):
-    def __init__(self, df_path, resample_rate=16000, clean_params=None, sep='\t', sort=True, *args, **kwargs):
+    def __init__(self, df_path, resample_rate=16000, df_filters=None, sep='\t', sort=True, *args, **kwargs):
         super(ParCzechDataset, self).__init__()
         df = pd.read_csv(df_path, sep=sep)
+        df = df[(df.type == 'train') | (df.type == 'other')]
+        if df_filters is not None:
+            self.df = clean_data_parczech(df, df_filters)
         self.df = clean_data(df, clean_params)
         if sort:
             self.df = self.df.sort_values(by=['duration__segments'], ascending=False).copy().reset_index(drop=True)
@@ -74,10 +79,13 @@ def clean_data(df, params):
     df = df[df.recognized_sound_coverage__segments < params['recognized_sound_coverage__segments_ub']]
     # removed 404.5 hours
     # use only long enough segments
-    df = df[df.duration__segments > params['duration__segments_lb']]
     ic(df.duration__segments.sum() / 3600)
-    df = df[df.duration__segments < params['duration__segments_ub']]
-    ic(df.duration__segments.sum() / 3600)
+    if 'duration__segments_lb' in params:
+        df = df[df.duration__segments > params['duration__segments_lb']]
+
+    if 'duration__segments_ub' in params:
+        df = df[df.duration__segments < params['duration__segments_ub']]
+        ic(df.duration__segments.sum() / 3600)
     return df
 
 

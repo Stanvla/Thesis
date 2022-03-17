@@ -3,6 +3,7 @@ import math
 import os
 import pickle
 from typing import Optional, Iterable
+import sys
 
 import numpy as np
 import pandas as pd
@@ -14,7 +15,11 @@ from icecream import ic
 from pytorch_lightning.utilities.types import TRAIN_DATALOADERS, EVAL_DATALOADERS
 from torch.utils.data import DataLoader
 
-from clustering.torch_mffc_extract import ParCzechDataset
+# depending on how the script is executed, interactively or not, use different path for importing
+if not sys.stdout.isatty():
+    from clustering.torch_mffc_extract import ParCzechDataset
+else:
+    from hubert.clustering.torch_mffc_extract import ParCzechDataset
 
 
 class ParCzechPretrain(ParCzechDataset):
@@ -75,12 +80,12 @@ class ParCzechPretrain(ParCzechDataset):
         return dict(
             wave=wave,
             target={k: torch.from_numpy(labels[km].values) for km, k in zip(self.km_labels, self.labels)},
-            idx=i,
-            duration=self.df.iloc[i].duration__segments
+            # idx=i,
+            # duration=self.df.iloc[i].duration__segments
         )
 
 
-class BucketFolderAwareDistributedSampler(Iterable):
+class DurationBucketedFolderAwareDistributedSampler(Iterable):
     """Sampler that restricts data loading to a subset of the dataset.
 
     It is especially useful in conjunction with `torch.nn.parallel.DistributedDataParallel`.
@@ -125,7 +130,7 @@ class BucketFolderAwareDistributedSampler(Iterable):
             seed: int = 0,
             drop_last: bool = False,
     ) -> None:
-        super(BucketFolderAwareDistributedSampler, self).__init__()
+        super(DurationBucketedFolderAwareDistributedSampler, self).__init__()
         if num_replicas is None:
             if not dist.is_available():
                 raise RuntimeError("Requires distributed package to be available")
@@ -267,7 +272,6 @@ class Collator:
         # batch is a list of dicts, with keys [wave, target]
         # batch[i]['target'] is also a dict with keys given by different k from k-means models
 
-        indices = [x['idx'] for x in batch]
         wavs = [x['wave'] for x in batch]
         padded_waves, wav_lens, max_len = self.pad_list(wavs)
         padded_waves = padded_waves.view(len(batch), max_len)
@@ -280,11 +284,12 @@ class Collator:
 
         # use only first element from pad_list() since it returns multiple things
         padded_targets = {k: self.pad_list(lst)[0] for k, lst in targets_by_k.items()}
+        # indices = [x['idx'] for x in batch]
         return dict(
             waves=padded_waves,
             lens=wav_lens,
             targets=padded_targets,
-            idx=torch.tensor(indices)
+            # idx=torch.tensor(indices)
         )
 
 
@@ -354,7 +359,7 @@ class ParCzechPretrainPL(pl.LightningDataModule):
         )
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
-        train_sampler = BucketFolderAwareDistributedSampler(
+        train_sampler = DurationBucketedFolderAwareDistributedSampler(
             dataset=self.train_data,
             batch_size=self.bs,
             batch_scale=self.batch_scale,
@@ -365,7 +370,7 @@ class ParCzechPretrainPL(pl.LightningDataModule):
         return self._get_loader(self.train_data, train_sampler)
 
     def val_dataloader(self) -> EVAL_DATALOADERS:
-        val_sampler = BucketFolderAwareDistributedSampler(
+        val_sampler = DurationBucketedFolderAwareDistributedSampler(
             dataset=self.val_data,
             batch_size=self.bs,
             batch_scale=self.batch_scale,
@@ -389,6 +394,7 @@ if __name__ == '__main__':
         recognized_sound_coverage__segments_lb=0.45,
         recognized_sound_coverage__segments_ub=0.93,
         duration__segments_lb=0.5,
+
     )
     params = dict(
         batch_size=2,
@@ -408,13 +414,13 @@ if __name__ == '__main__':
 
     ks = [15]
 
-    # dataset = ParCzechPretrain(
-    #     df_path,
-    #     ks,
-    #     clean_params=parczech_clean_params,
-    #     label_path=labels_path,
-    #     sep=',',
-    # )
+    dataset = ParCzechPretrain(
+        df_path,
+        ks,
+        clean_params=parczech_clean_params,
+        label_path=labels_path,
+        sep=',',
+    )
 
     # %%
     # %%
