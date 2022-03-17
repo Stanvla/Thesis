@@ -315,53 +315,52 @@ class HubertPretrainPL(pl.LightningModule):
         _ = self._epoch_end(outputs, 'Train')
 
     def validation_epoch_end(self, outputs):
-        total_loss, masked_loss, _, total_acc, masked_acc, _ = self._epoch_end(outputs, 'Val')
+        total_loss, _, _, total_acc, masked_acc, _ = self._epoch_end(outputs, 'Val')
         self.log('val_total_loss', total_loss, logger=False, sync_dist=True)
-        self.log('val_masked_loss', masked_loss, logger=False, sync_dist=True)
-
         self.log('val_total_acc', total_acc, logger=False, sync_dist=True)
         self.log('val_masked_acc', masked_acc, logger=False, sync_dist=True)
 
 
 def get_logging_dir_name(parameters, clusters):
     naming = dict(
-        deterministic='det',
+        deterministic='det-{}',
         # ------------ model params --------------
-        sim='sim',
-        mask_weight='mw',
-        reduction='red',
-        softmax_temp='st',
-        peak_lr='lr',
-        warm_up='wu',
+        sim='sim-{}',
+        mask_weight='mw-{:.2f}',
+        reduction='red-{}',
+        softmax_temp='st{:.2f}',
+        peak_lr='lr-{:.5f}',
+        warm_up='wu-{:.2f}',
         # ------------ dataset params ------------
-        batch_size='bs',
+        batch_size='bs{}',
         # ------------ trainer params ------------
-        epochs='ep',
+        epochs='ep{:03}',
     )
     if parameters['limit_train_batches'] == 1.0 and not parameters['fast_dev_run'] or \
             parameters['limit_train_batches'] != 1.0 and parameters['fast_dev_run']:
         raise RuntimeError(f'Just one of the [limit_train_batches, fast_dev_run] should be unspecified')
 
-    result = [f'ks=' + '_'.join(list(map(str, clusters)))]
+    result = [f'ks-' + '.'.join(list(map(str, clusters)))]
 
     if parameters['limit_train_batches'] != 1.0:
-        result.append(f'cnt={parameters["limit_train_batches"]}')
+        result.append(f'cnt-{parameters["limit_train_batches"]}')
 
     if parameters['fast_dev_run']:
-        result.append(f'cnt={parameters["fast_dev_run"]}')
+        result.append(f'cnt-{parameters["fast_dev_run"]}')
 
     for key, name in naming.items():
-        if isinstance(parameters[key], float):
-            result.append(f'{name}={parameters[key]:.2f}')
-        else:
-            result.append(f'{name}={parameters[key]}')
-    return '_'.join(result) + '__' + datetime.now().strftime('%d.%m__%H.%M')
+        result.append(name.format(parameters[key]))
+
+    time = datetime.now().strftime('%d.%m__%H.%M')
+    return '_'.join(result), time
 
 
 # %%
 if __name__ == '__main__':
     # %%
     # ic.configureOutput(includeContext=True)
+    ckp_path_pretrain = ''
+
     # ............................................... Parameters .......................................................
     df_path = '/lnet/express/work/people/stankov/alignment/subset/subset.csv'
     labels_path = '/lnet/express/work/people/stankov/alignment/clustering_all/segments'
@@ -388,7 +387,7 @@ if __name__ == '__main__':
         proj_dim=256,
         warm_up=0.1,
         # ------------ dataset params ------------
-        batch_size=4,
+        batch_size=2,
         num_workers=8,
         drop_last=False,
         batch_scale=10,
@@ -397,13 +396,13 @@ if __name__ == '__main__':
         # ------------ trainer params ------------
         n_gpus=torch.cuda.device_count(),
         epochs=50,
-        stragegy='ddp',
+        strategy='ddp',
         accelerator='gpu',
         fast_dev_run=False,
         overfit_batches=None,
         num_processes=1,
-        limit_train_batches=200,
-        limit_val_batches=100,
+        limit_train_batches=2000,
+        limit_val_batches=1000,
     )
     params['num_workers'] = params['num_workers'] * params['n_gpus']
 
@@ -453,44 +452,58 @@ if __name__ == '__main__':
     # ............................................... Training .......................................................
     # Logs are saved to os.path.join(save_dir, name, version)
     # save_dir/name/sub_dir/version
-    logging_dir = get_logging_dir_name(params, ks)
-    logger = TensorBoardLogger(save_dir='logs', name=logging_dir)
+    logging_dir, cur_time = get_logging_dir_name(params, ks)
+    logger = TensorBoardLogger(save_dir='logs', name=logging_dir, version=cur_time)
 
+    checkpoint_dir = os.path.join('logs', logging_dir, f'{cur_time}', 'checkpoints')
+    checkpoint_fn = '.ep{epoch:03d}__val_tot_loss-{val_total_loss:.3f}__val_tot_acc-{val_total_acc:.3f}__val_mask_acc-{val_masked_acc:.3f}'
     # save based on valid loss and valid acc
-    # loss_checkpoint_callback = ModelCheckpoint(
-    #     monitor="val_loss",
-    #     dirpath=os.path.join(logging_dir, 'checkpoints'),
-    #     filename='{epoch:02d}--{val_loss:.2f}',
-    #     mode='min'
-    # )
-    # acc_checkpoint_callback = ModelCheckpoint(
-    #     monitor="val_acc",
-    #     dirpath=os.path.join(logging_dir, 'checkpoints'),
-    #     filename='{epoch:02d}--{val_acc:.2f}',
-    #     mode='max'
-    # )
-    # cb = [loss_checkpoint_callback, acc_checkpoint_callback]
+    loss_checkpoint_callback = ModelCheckpoint(
+        monitor="val_total_loss",
+        mode='min',
+        dirpath=checkpoint_dir,
+        auto_insert_metric_name=False,
+        filename='tot_loss' + checkpoint_fn,
+        save_weights_only=True,
+    )
+
+    masked_acc_checkpoint_callback = ModelCheckpoint(
+        monitor="val_masked_acc",
+        mode='max',
+        dirpath=checkpoint_dir,
+        auto_insert_metric_name=False,
+        filename='mask_acc' + checkpoint_fn,
+        save_weights_only=True,
+    )
+    last_checkpoint_callback = ModelCheckpoint(
+        dirpath=checkpoint_dir,
+        auto_insert_metric_name=False,
+        filename='last_ckp' + checkpoint_fn,
+        save_weights_only=True,
+    )
 
     trainer = pl.Trainer(
-        # num_sanity_val_steps=0,
+        num_sanity_val_steps=0,
         max_epochs=params['epochs'],
         deterministic=params['deterministic'],
         # check_val_every_n_epoch=0,
         # fast_dev_run=10,
         gpus=params['n_gpus'],
         fast_dev_run=params['fast_dev_run'],
-        enable_checkpointing=False,
+        # enable_checkpointing=False,
         replace_sampler_ddp=False,
         accelerator=params['accelerator'],
-        strategy=params['stragegy'],
+        strategy=params['strategy'],
         num_processes=params['num_processes'],
         limit_train_batches=params['limit_train_batches'],
         limit_val_batches=params['limit_val_batches'],
+        callbacks=[loss_checkpoint_callback, masked_acc_checkpoint_callback, last_checkpoint_callback],
         logger=logger,
         precision=16,
-        # callbacks=cb,
     )
 
-
-    trainer.fit(hubert_pretrain, dataset)
+    if ckp_path_pretrain == '':
+        trainer.fit(hubert_pretrain, dataset)
+    else:
+        raise NotImplementedError('Implement uploading the checkpoints')
     # %%
