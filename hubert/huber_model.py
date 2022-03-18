@@ -1,5 +1,6 @@
 # %%
 import os
+import sys
 from collections import OrderedDict
 from datetime import datetime
 import pytorch_lightning as pl
@@ -12,11 +13,16 @@ from pytorch_lightning.loggers import TensorBoardLogger
 from torch import nn
 from torch import optim
 from torchmetrics.functional import accuracy
-
-from hubert.filter_dataframe import FilterLB, FilterUB
-from pretrain_dataset import ParCzechPretrainPL
 import math
-import pickle
+
+if not sys.__stdin__.isatty():
+    # running in interactive shell
+    from hubert.pretrain_dataset import ParCzechPretrainPL
+    from hubert.clustering.filter_dataframe import FilterLB, FilterUB
+else:
+    from pretrain_dataset import ParCzechPretrainPL
+    from clustering.filter_dataframe import FilterLB, FilterUB
+
 
 
 class HubertPretrainPL(pl.LightningModule):
@@ -291,26 +297,27 @@ class HubertPretrainPL(pl.LightningModule):
         total_loss = sum(out['loss'] for out in outputs) / len(outputs)
         masked_loss = sum(out['mask_loss'] for out in outputs) / len(outputs)
         unmasked_loss = sum(out['unmask_loss'] for out in outputs) / len(outputs)
-        total_loss = self.all_gather(total_loss)
-        masked_loss = self.all_gather(masked_loss)
-        unmasked_loss = self.all_gather(unmasked_loss)
+        total_loss = self.all_gather(total_loss).mean()
+        masked_loss = self.all_gather(masked_loss).mean()
+        unmasked_loss = self.all_gather(unmasked_loss).mean()
 
         total_acc = sum(out['total_acc'] for out in outputs) / len(outputs)
         masked_acc = sum(out['mask_acc'] for out in outputs) / len(outputs)
         unmasked_acc = sum(out['unmask_acc'] for out in outputs) / len(outputs)
-        total_acc = self.all_gather(total_acc)
-        masked_acc = self.all_gather(masked_acc)
-        unmasked_acc = self.all_gather(unmasked_acc)
+        total_acc = self.all_gather(total_acc).mean()
+        masked_acc = self.all_gather(masked_acc).mean()
+        unmasked_acc = self.all_gather(unmasked_acc).mean()
 
-        # ic(total_loss, masked_loss, unmasked_loss, total_acc, masked_acc, unmasked_acc)
+        # log only at rank 0
+        if self.global_rank == 0:
+            # ic(total_loss, masked_loss, unmasked_loss, total_acc, masked_acc, unmasked_acc)
+            self.logger.experiment.add_scalar(f'Loss Total/{name}', total_loss, self.current_epoch)
+            self.logger.experiment.add_scalar(f'Loss Masked/{name}', masked_loss, self.current_epoch)
+            self.logger.experiment.add_scalar(f'Loss Unmasked/{name}', unmasked_loss, self.current_epoch)
 
-        self.logger.experiment.add_scalar(f'Loss Total/{name}', total_loss, self.current_epoch)
-        self.logger.experiment.add_scalar(f'Loss Masked/{name}', masked_loss, self.current_epoch)
-        self.logger.experiment.add_scalar(f'Loss Unmasked/{name}', unmasked_loss, self.current_epoch)
-
-        self.logger.experiment.add_scalar(f'Acc Total/{name}', total_acc, self.current_epoch)
-        self.logger.experiment.add_scalar(f'Acc Masked/{name}', masked_acc, self.current_epoch)
-        self.logger.experiment.add_scalar(f'Acc Unmasked/{name}', unmasked_acc, self.current_epoch)
+            self.logger.experiment.add_scalar(f'Acc Total/{name}', total_acc, self.current_epoch)
+            self.logger.experiment.add_scalar(f'Acc Masked/{name}', masked_acc, self.current_epoch)
+            self.logger.experiment.add_scalar(f'Acc Unmasked/{name}', unmasked_acc, self.current_epoch)
         return total_loss, masked_loss, unmasked_loss, total_acc, masked_acc, unmasked_acc
 
     def training_epoch_end(self, outputs):
@@ -394,18 +401,18 @@ if __name__ == '__main__':
         num_workers=8,
         drop_last=False,
         batch_scale=10,
-        pin_memory=True,
+        pin_memory=torch.cuda.is_available(),
         val_fraction=0.1,
         # ------------ trainer params ------------
         n_gpus=torch.cuda.device_count(),
         epochs=50,
         strategy='ddp',
-        accelerator='gpu',
+        accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         fast_dev_run=False,
         overfit_batches=None,
-        num_processes=1,
-        limit_train_batches=2000,
-        limit_val_batches=1000,
+        num_processes=1 if torch.cuda.is_available() else 2,
+        limit_train_batches=200,
+        limit_val_batches=100,
     )
     params['num_workers'] = params['num_workers'] * params['n_gpus']
 
@@ -413,7 +420,7 @@ if __name__ == '__main__':
     # ............................................... Dataset .......................................................
 
     dataset = ParCzechPretrainPL(
-        clean_params=parczech_clean_params,
+        parczech_filters=parczech_filters,
         data_path=df_path,
         km_labels=ks,
         labels_path=labels_path,

@@ -16,15 +16,16 @@ from pytorch_lightning.utilities.types import TRAIN_DATALOADERS, EVAL_DATALOADER
 from torch.utils.data import DataLoader
 
 # depending on how the script is executed, interactively or not, use different path for importing
-if not sys.stdout.isatty():
-    from clustering.torch_mffc_extract import ParCzechDataset
-else:
+if not sys.__stdin__.isatty():
+    # interactive shell
     from hubert.clustering.torch_mffc_extract import ParCzechDataset
+else:
+    from clustering.torch_mffc_extract import ParCzechDataset
 
 
 class ParCzechPretrain(ParCzechDataset):
-    def __init__(self, df_path, km_labels, resample_rate=16000, clean_params=None, label_path=None, sep='\t'):
-        super(ParCzechPretrain, self).__init__(df_path, resample_rate, clean_params, sep=sep, sort=False)
+    def __init__(self, df_path, km_labels, resample_rate=16000, filters=None, label_path=None, sep='\t'):
+        super(ParCzechPretrain, self).__init__(df_path, resample_rate, df_filters=filters, sep=sep, sort=False)
 
         self.label_path = label_path
         with open(os.path.join(self.label_path, 'mp3_to_int.pickle'), 'rb') as f:
@@ -296,7 +297,7 @@ class Collator:
 class ParCzechPretrainPL(pl.LightningDataModule):
     def __init__(
             self,
-            clean_params,
+            parczech_filters,
             data_path,
             km_labels,
             labels_path,
@@ -312,7 +313,7 @@ class ParCzechPretrainPL(pl.LightningDataModule):
             val_frac,
     ):
         super(ParCzechPretrainPL, self).__init__()
-        self.clean_params = clean_params
+        self.parczech_filters = parczech_filters
         self.data_path = data_path
         self.km_labels = km_labels
         self.labels_path = labels_path
@@ -329,14 +330,14 @@ class ParCzechPretrainPL(pl.LightningDataModule):
         self.train_data = ParCzechPretrain(
             df_path=self.data_path,
             km_labels=self.km_labels,
-            clean_params=self.clean_params,
+            filters=self.parczech_filters,
             label_path=self.labels_path,
             sep=','
         )
         self.val_data = ParCzechPretrain(
             df_path=self.data_path,
             km_labels=self.km_labels,
-            clean_params=self.clean_params,
+            filters=self.parczech_filters,
             label_path=self.labels_path,
             sep=','
         )

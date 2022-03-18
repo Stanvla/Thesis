@@ -2,6 +2,7 @@
 import logging
 import os.path
 import shutil
+import sys
 from typing import Optional
 
 import matplotlib.pyplot as plt
@@ -13,7 +14,11 @@ import torchaudio
 from icecream import ic
 from torch.utils.data import Dataset, DataLoader
 
-from hubert.filter_dataframe import clean_data_parczech
+if not sys.__stdin__.isatty():
+    # running in interactive shell
+    from hubert.clustering.filter_dataframe import clean_data_parczech
+else:
+    from filter_dataframe import clean_data_parczech
 
 
 class ParCzechDataset(Dataset):
@@ -22,8 +27,9 @@ class ParCzechDataset(Dataset):
         df = pd.read_csv(df_path, sep=sep)
         df = df[(df.type == 'train') | (df.type == 'other')]
         if df_filters is not None:
+            df = df[(df.type == 'train') | (df.type == 'other')]
             self.df = clean_data_parczech(df, df_filters)
-        self.df = clean_data(df, clean_params)
+        # self.df = clean_data(df, clean_params)
         if sort:
             self.df = self.df.sort_values(by=['duration__segments'], ascending=False).copy().reset_index(drop=True)
         self.new_sr = resample_rate
