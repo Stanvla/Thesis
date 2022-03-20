@@ -330,7 +330,7 @@ class HubertPretrainPL(pl.LightningModule):
         self.log('val_masked_acc', masked_acc, logger=False, sync_dist=True)
 
 
-def get_logging_dir_name(parameters, clusters):
+def get_logging_dir_name(parameters, data, clusters):
     naming = dict(
         deterministic='det-{}',
         # ------------ model params --------------
@@ -340,16 +340,19 @@ def get_logging_dir_name(parameters, clusters):
         softmax_temp='st{:.2f}',
         peak_lr='lr-{:.5f}',
         warm_up='wu-{:.2f}',
-        # ------------ dataset params ------------
-        batch_size='bs{}',
         # ------------ trainer params ------------
         epochs='ep{:03}',
     )
-    if parameters['limit_train_batches'] == 1.0 and not parameters['fast_dev_run'] or \
-            parameters['limit_train_batches'] != 1.0 and parameters['fast_dev_run']:
-        raise RuntimeError(f'Just one of the [limit_train_batches, fast_dev_run] should be unspecified')
+    effective_batch_size = parameters["batch_size"] * parameters["n_gpus"]
+    result = [
+        f'ks-' + '.'.join(list(map(str, clusters))),
+        f'ebs{effective_batch_size}'
+    ]
 
-    result = [f'ks-' + '.'.join(list(map(str, clusters)))]
+    if parameters['limit_train_batches'] == 1.0 and not parameters['fast_dev_run']:
+        cnt = len(data.train_data) // effective_batch_size
+        ic('Using all train data')
+        result.append(f'cnt{cnt}')
 
     if parameters['limit_train_batches'] != 1.0:
         result.append(f'cnt-{parameters["limit_train_batches"]}')
@@ -397,7 +400,7 @@ if __name__ == '__main__':
         proj_dim=256,
         warm_up=0.1,
         # ------------ dataset params ------------
-        batch_size=2,
+        batch_size=4,
         num_workers=8,
         drop_last=False,
         batch_scale=10,
@@ -411,8 +414,8 @@ if __name__ == '__main__':
         fast_dev_run=False,
         overfit_batches=None,
         num_processes=1 if torch.cuda.is_available() else 2,
-        limit_train_batches=200,
-        limit_val_batches=100,
+        limit_train_batches=1.0,
+        limit_val_batches=1.0,
     )
     params['num_workers'] = params['num_workers'] * params['n_gpus']
 
@@ -462,7 +465,7 @@ if __name__ == '__main__':
     # ............................................... Training .......................................................
     # Logs are saved to os.path.join(save_dir, name, version)
     # save_dir/name/sub_dir/version
-    logging_dir, cur_time = get_logging_dir_name(params, ks)
+    logging_dir, cur_time = get_logging_dir_name(params, dataset, ks)
     logger = TensorBoardLogger(save_dir='logs', name=logging_dir, version=cur_time)
 
     checkpoint_dir = os.path.join('logs', logging_dir, f'{cur_time}', 'checkpoints')

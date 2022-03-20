@@ -55,7 +55,7 @@ class ParCzechPretrain(ParCzechDataset):
         mp3 = self.df.iloc[i].mp3.astype(str)
         mp3_folder = f'{self.mp3_to_int[mp3]}'
         if mp3_folder != self.current_folder:
-            # ic(mp3_folder)
+            ic(mp3_folder)
             self.get_df_from_folder(mp3_folder)
             self.current_folder = mp3_folder
         # get segment name in form `mp3/segm_index`

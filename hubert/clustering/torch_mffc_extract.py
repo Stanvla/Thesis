@@ -13,25 +13,26 @@ import torch.nn.functional as F
 import torchaudio
 from icecream import ic
 from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
 
-if not sys.__stdin__.isatty():
-    # running in interactive shell
+try:
     from hubert.clustering.filter_dataframe import clean_data_parczech
-else:
+except ModuleNotFoundError:
     from filter_dataframe import clean_data_parczech
 
 
 class ParCzechDataset(Dataset):
-    def __init__(self, df_path, resample_rate=16000, df_filters=None, sep='\t', sort=True, *args, **kwargs):
+    def __init__(self, df_path, resample_rate=16000, df_filters=None, sep='\t', sort=True, train_flag=True, *args, **kwargs):
         super(ParCzechDataset, self).__init__()
-        df = pd.read_csv(df_path, sep=sep)
-        df = df[(df.type == 'train') | (df.type == 'other')]
-        if df_filters is not None:
-            df = df[(df.type == 'train') | (df.type == 'other')]
-            self.df = clean_data_parczech(df, df_filters)
-        # self.df = clean_data(df, clean_params)
+        self.df = pd.read_csv(df_path, sep=sep)
+        self.filter_df(df_filters)
+
+        if train_flag:
+            self.df = self.df[(self.df.type == 'train') | (self.df.type == 'other')]
+
         if sort:
             self.df = self.df.sort_values(by=['duration__segments'], ascending=False).copy().reset_index(drop=True)
+
         self.new_sr = resample_rate
         self.resample_transform = None
 
@@ -64,6 +65,33 @@ class ParCzechDataset(Dataset):
         if wav.size(0) == 2:
             wav = torch.mean(wav, dim=0).unsqueeze(0)
         return self.resample(sr, wav)
+
+    def duration_hours(self, filters=None):
+        if filters is not None:
+            df = clean_data_parczech(self.df, filters)
+        else:
+            df = self.df
+        return df.duration__segments.sum() / 3600
+
+    def plot_stat(self, col_name, filters=None):
+        if filters is not None:
+            df = clean_data_parczech(self.df, filters)
+        else:
+            df = self.df
+
+        print(df.sort_values(by=[col_name])[col_name])
+        plt.plot(range(len(df)), df.sort_values(by=[col_name])[col_name])
+        plt.title(f'{col_name} sorted, {self.duration_hours(filters):.2f}h')
+        plt.xlabel('segments')
+        plt.ylabel(col_name)
+        plt.show()
+
+    def filter_df(self, filters):
+        if filters is not None:
+            self.df = clean_data_parczech(self.df, filters)
+
+    def get_columns(self):
+        return self.df.columns.values
 
     def __getitem__(self, i):
         path = self.extract_path(i)
