@@ -14,6 +14,7 @@ import torchaudio
 from icecream import ic
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
+from io import StringIO
 
 try:
     from hubert.clustering.filter_dataframe import clean_data_parczech
@@ -22,7 +23,7 @@ except ModuleNotFoundError:
 
 
 class ParCzechDataset(Dataset):
-    def __init__(self, df_path, resample_rate=16000, df_filters=None, sep='\t', sort=True, train_flag=True, *args, **kwargs):
+    def __init__(self, df_path, resample_rate=16000, df_filters=None, sep='\t', sort=True, train_flag=True, iloc=True, *args, **kwargs):
         super(ParCzechDataset, self).__init__()
         self.df = pd.read_csv(df_path, sep=sep)
         self.filter_df(df_filters)
@@ -35,15 +36,32 @@ class ParCzechDataset(Dataset):
 
         self.new_sr = resample_rate
         self.resample_transform = None
+        # this configures the __getitem__ method, when self.iloc is true index in __getitem__ is interpreted as integer location in dataframe
+        # when self.iloc is False index in __getitem__ is interpreted as an element in self.df.index
+        self.iloc = iloc
 
-    def extract_path(self, i):
-        row = self.df.iloc[i]
-        # need to remove prefix  'sentences_'
+    def index_df(self, i, column_name=None):
+        if self.iloc:
+            row = self.df.iloc[i]
+        else:
+            row = self.df.loc[i]
+
+        if column_name is not None:
+            return row[column_name]
+        return row
+
+    def get_mp3_name(self, i):
+        row = self.index_df(i)
         try:
+            # need to remove prefix  'sentences_'
             mp3_name = row.mp3_name.split('_')[-1]
         except:
             ic(row)
+        return mp3_name
 
+    def extract_path(self, i):
+        row = self.index_df(i)
+        mp3_name = self.get_mp3_name(i)
         return os.path.join(row.segment_path, mp3_name)
 
     def get_gold_transcript(self, path):
@@ -53,6 +71,66 @@ class ParCzechDataset(Dataset):
     def get_asr_transcript(self, path):
         with open(f'{path}.asr', 'r') as f:
             return f.read().rstrip()
+
+    def get_recognized_df(self, path, i):
+        # will extract recognized based on word ids
+        header = ['word', 'word_id', 'start_time', 'end_time', 'XXX', 'avg_char_duration', 'speaker']
+        words_df = pd.read_csv(f'{path}.words', names=header, sep='\t', header=None)
+        word_ids = words_df['word_id'].values.tolist()
+
+        # read aligned file
+        path_aligned = f"/lnet/express/work/people/stankov/alignment/results/full/words-aligned/jan/words_{self.get_mp3_name(i)}.tsv"
+        # normalization is done by the length of the "true_word"
+        header_aligned = ['true_w', 'trans_w', 'joined', 'id', 'recognized', 'dist', 'dist_norm', 'start', 'end', 'time_len_ms', 'time_len_norm']
+        dtypes = dict(
+            true_w=str,
+            trans_w=str,
+            joined=bool,
+            id=str,
+            recognized=bool
+        )
+        for name in header_aligned:
+            if name not in dtypes:
+                dtypes[name] = float
+
+        replace_dict = {
+            '"': "__double_quotes__",
+        }
+        with open(path_aligned, 'r') as f:
+            aligned_df_src = ''.join(f.readlines())
+
+        for k, v in replace_dict.items():
+            aligned_df_src = aligned_df_src.replace(k, v)
+
+        aligned_df_src = [l.replace(k, v) for l in aligned_df_src for k, v in replace_dict.items()]
+        aligned_df_src = ''.join(aligned_df_src)
+        aligned_df = pd.read_csv(StringIO(aligned_df_src), names=header_aligned, dtype=dtypes, na_values='-', header=0, sep='\t')
+        aligned_df.trans_w = aligned_df.trans_w.fillna('-')
+
+        if "__double_quotes__" in aligned_df_src:
+            inv_replace_dict = {v: k for k, v in replace_dict.items()}
+            aligned_df = aligned_df.replace({"true_w": inv_replace_dict, "trans_w": inv_replace_dict})
+
+        aligned_df = aligned_df[aligned_df['id'].isin(word_ids)]
+        return aligned_df
+
+    def get_recognized_transcript(self, path, i):
+        aligned_df = self.get_recognized_df(path, i)
+        # from miliseconds to seconds
+        start_time = aligned_df['start'].min() / 1000
+        end_time = aligned_df['end'].max() / 1000
+        mp3_name = self.get_mp3_name(i)
+
+        path_transcribed = f'/lnet/express/work/people/stankov/alignment/results/full/scrapping/jan/{mp3_name}/{mp3_name}.tsv'
+        if not os.path.isfile(path_transcribed):
+            # print(f'{mp3_name} is not in scraping')
+            path_transcribed = f'/lnet/express/work/people/stankov/alignment/results/full/time-extracted/jan/{mp3_name}.tsv'
+
+        header_transcribed = ['start', 'end', 'recognized', 'true_word', 'cnt', 'dist']
+        transcribed_df = pd.read_csv(path_transcribed, names=header_transcribed, header=None, sep='\t')
+        # ic(start_time, end_time, transcribed_df.head())
+        transcript = transcribed_df[(transcribed_df.start >= start_time) & (transcribed_df.end <= end_time)].recognized.values.tolist()
+        return ' '.join(transcript)
 
     def resample(self, sr, wav):
         if self.resample_transform is None:
@@ -78,6 +156,7 @@ class ParCzechDataset(Dataset):
             df = clean_data_parczech(self.df, filters)
         else:
             df = self.df
+        # plt.boxplot(dataset.df.avg_char_duration__segments, vert=False)
 
         print(df.sort_values(by=[col_name])[col_name])
         plt.plot(range(len(df)), df.sort_values(by=[col_name])[col_name])
@@ -86,9 +165,13 @@ class ParCzechDataset(Dataset):
         plt.ylabel(col_name)
         plt.show()
 
-    def filter_df(self, filters):
-        if filters is not None:
-            self.df = clean_data_parczech(self.df, filters)
+    def filter_df(self, filters, reset_index=False):
+        if filters is None:
+            return
+
+        self.df = clean_data_parczech(self.df, filters)
+        if reset_index:
+            self.df.reset_index(drop=True, inplace=True)
 
     def get_columns(self):
         return self.df.columns.values

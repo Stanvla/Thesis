@@ -243,11 +243,14 @@ class HubertPretrainPL(pl.LightningModule):
 
         return total_mask_loss, total_unmask_loss, total_mask_acc, total_unmask_acc, total_acc
 
-    def _perform_step(self, batch):
+    def _perform_step(self, batch, batch_index):
         inputs, wave_lens, targets = batch['waves'], batch['lens'], batch['targets']
         # inputs.shape = [batch, max_wave_len]
         # wave_lens.shape = [batch]
         # targets[k].shape = [batch, n_frames] ... targets is a dict and n_frames << max_wave_len
+        # ic(batch_index)
+        # for k, v in targets.items():
+        #     ic(k, v.shape, v.element_size(), v.nelement(), v.element_size() * v.nelement())
 
         encoder_features, frames_cnt, batch_masks = self(inputs, wave_lens)
         # encoder_features.shape = [batch, max_seq_len, hubert_features]
@@ -259,7 +262,7 @@ class HubertPretrainPL(pl.LightningModule):
         return total_loss, mask_loss.detach(), unmask_loss.detach(), total_acc.detach(), mask_acc.detach(), unmask_acc.detach()
 
     def training_step(self, batch, batch_index):
-        total_loss, mask_loss, unmask_loss, total_acc, mask_acc, unmask_acc = self._perform_step(batch)
+        total_loss, mask_loss, unmask_loss, total_acc, mask_acc, unmask_acc = self._perform_step(batch, batch_index)
         return dict(
             loss=total_loss,
             mask_loss=mask_loss,
@@ -270,7 +273,7 @@ class HubertPretrainPL(pl.LightningModule):
         )
 
     def validation_step(self, batch, batch_index):
-        total_loss, mask_loss, unmask_loss, total_acc, mask_acc, unmask_acc = self._perform_step(batch)
+        total_loss, mask_loss, unmask_loss, total_acc, mask_acc, unmask_acc = self._perform_step(batch, batch_index)
         return dict(
             loss=total_loss,
             mask_loss=mask_loss,
@@ -380,7 +383,7 @@ if __name__ == '__main__':
         FilterLB(value=0.45, name='recognized_sound_coverage__segments'),
         FilterUB(value=0.93, name='recognized_sound_coverage__segments'),
         FilterLB(value=0.5, name='duration__segments'),
-        FilterUB(value=20, name='duration__segments'),
+        FilterUB(value=37, name='duration__segments'),
     ]
 
     params = dict(
@@ -400,8 +403,8 @@ if __name__ == '__main__':
         proj_dim=256,
         warm_up=0.1,
         # ------------ dataset params ------------
-        batch_size=4,
-        num_workers=8,
+        batch_size=2,
+        num_workers=2,
         drop_last=False,
         batch_scale=10,
         pin_memory=torch.cuda.is_available(),
@@ -419,7 +422,7 @@ if __name__ == '__main__':
     )
     params['num_workers'] = params['num_workers'] * params['n_gpus']
 
-    ks = [15, 25, 100]
+    ks = [50, 100, 200]
     # ............................................... Dataset .......................................................
 
     dataset = ParCzechPretrainPL(
@@ -492,7 +495,7 @@ if __name__ == '__main__':
         dirpath=checkpoint_dir,
         auto_insert_metric_name=False,
         filename='last_ckp' + checkpoint_fn,
-        save_weights_only=True,
+        save_weights_only=False,
     )
 
     trainer = pl.Trainer(
@@ -513,6 +516,7 @@ if __name__ == '__main__':
         callbacks=[loss_checkpoint_callback, masked_acc_checkpoint_callback, last_checkpoint_callback],
         logger=logger,
         precision=16,
+        enable_progress_bar=True,
     )
 
     if ckp_path_pretrain == '':

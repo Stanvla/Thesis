@@ -4,7 +4,7 @@ import os
 import pickle
 from typing import Optional, Iterable
 import sys
-
+import time
 import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
@@ -52,14 +52,14 @@ class ParCzechPretrain(ParCzechDataset):
         return sorted(list(set(self.mp3_to_int.values())))
 
     def get_labels(self, i):
-        mp3 = self.df.iloc[i].mp3.astype(str)
+        mp3 = self.index_df(i, 'mp3').astype(str)
         mp3_folder = f'{self.mp3_to_int[mp3]}'
         if mp3_folder != self.current_folder:
-            ic(mp3_folder)
+            # ic(mp3_folder)
             self.get_df_from_folder(mp3_folder)
             self.current_folder = mp3_folder
         # get segment name in form `mp3/segm_index`
-        segment = self.df.iloc[i].segment_path
+        segment = self.index_df(i, 'segment_path')
         segment = '/'.join(segment.split('/')[-2:])
 
         result_df = self.current_targ_df[self.current_targ_df.segm == segment].sort_values(by=['id'])
@@ -67,13 +67,35 @@ class ParCzechPretrain(ParCzechDataset):
 
     def get_df_from_folder(self, folder_path):
         dfs = []
+        start_time = time.time()
+        names = ['km5', 'km10', 'km15', 'km20', 'km25', 'km50', 'km75', 'km100', 'km200', 'km250', 'km300', 'km500', 'path', 'mp3', 'segm']
+        usecols = self.km_labels + ['path', 'segm']
+        dtype = {}
+        for col in usecols:
+            if col in self.km_labels:
+                dtype[col] = np.int64
+            else:
+                dtype[col] = str
+
         files = os.listdir(os.path.join(self.label_path, folder_path))
         for f in sorted(files):
             if f.endswith('.csv'):
-                dfs.append(pd.read_csv(os.path.join(self.label_path, folder_path, f)))
-        self.current_targ_df = pd.concat(dfs).drop(columns=['mp3'])
+                dfs.append(pd.read_csv(
+                    os.path.join(self.label_path, folder_path, f),
+                    names=names,
+                    usecols=usecols,
+                    # dtype=dtype,
+                    header=0,
+                    sep=','
+                ))
+
+        # self.current_targ_df = pd.concat(dfs).drop(columns=['mp3'])
+        self.current_targ_df = pd.concat(dfs)
         self.current_targ_df['id'] = self.current_targ_df.path.str.split('/').str[-1].astype(int)
+        # self.current_targ_df['segm'] = self.current_targ_df.path.str.split('/').str[:-1].str.join('/')
         self.current_targ_df.drop(columns=['path'], inplace=True)
+        ic(time.time() - start_time)
+        # ic(self.current_targ_df.head())
 
     def __getitem__(self, i):
         labels = self.get_labels(i)
@@ -82,7 +104,6 @@ class ParCzechPretrain(ParCzechDataset):
             wave=wave,
             target={k: torch.from_numpy(labels[km].values) for km, k in zip(self.km_labels, self.labels)},
             # idx=i,
-            # duration=self.df.iloc[i].duration__segments
         )
 
 
