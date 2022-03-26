@@ -57,6 +57,7 @@ class ParCzechDataset(Dataset):
             mp3_name = row.mp3_name.split('_')[-1]
         except:
             ic(row)
+            raise ValueError(f'can not find row by index {i}')
         return mp3_name
 
     def extract_path(self, i):
@@ -72,10 +73,41 @@ class ParCzechDataset(Dataset):
         with open(f'{path}.asr', 'r') as f:
             return f.read().rstrip()
 
+    def _safe_read_df(self, path, names, header, sep, dtypes, na_values):
+        if not os.path.isfile(path):
+            print(f'{path} does not exist')
+        replace_dict = {
+            '"': "__double_quotes__",
+        }
+        with open(path, 'r') as f:
+            src = ''.join(f.readlines())
+
+        for k, v in replace_dict.items():
+            src = src.replace(k, v)
+
+        df = pd.read_csv(StringIO(src), names=names, header=header, sep=sep, dtype=dtypes, na_values=na_values)
+
+        return df
+
     def get_recognized_df(self, path, i):
         # will extract recognized based on word ids
         header = ['word', 'word_id', 'start_time', 'end_time', 'XXX', 'avg_char_duration', 'speaker']
-        words_df = pd.read_csv(f'{path}.words', names=header, sep='\t', header=None)
+
+        try:
+            words_df = self._safe_read_df(
+                f'{path}.words',
+                names=header,
+                header=None,
+                sep='\t',
+                # replace_col=['word'],
+                dtypes=None,
+                na_values=None,
+            )
+        except Exception as e:
+            ic(path)
+            ic(e)
+            raise ValueError(f'Can not read file {path}')
+
         word_ids = words_df['word_id'].values.tolist()
 
         # read aligned file
@@ -93,24 +125,15 @@ class ParCzechDataset(Dataset):
             if name not in dtypes:
                 dtypes[name] = float
 
-        replace_dict = {
-            '"': "__double_quotes__",
-        }
-        with open(path_aligned, 'r') as f:
-            aligned_df_src = ''.join(f.readlines())
-
-        for k, v in replace_dict.items():
-            aligned_df_src = aligned_df_src.replace(k, v)
-
-        aligned_df_src = [l.replace(k, v) for l in aligned_df_src for k, v in replace_dict.items()]
-        aligned_df_src = ''.join(aligned_df_src)
-        aligned_df = pd.read_csv(StringIO(aligned_df_src), names=header_aligned, dtype=dtypes, na_values='-', header=0, sep='\t')
+        aligned_df = self._safe_read_df(
+            path_aligned,
+            header_aligned,
+            sep='\t',
+            dtypes=dtypes,
+            na_values='-',
+            header=0
+        )
         aligned_df.trans_w = aligned_df.trans_w.fillna('-')
-
-        if "__double_quotes__" in aligned_df_src:
-            inv_replace_dict = {v: k for k, v in replace_dict.items()}
-            aligned_df = aligned_df.replace({"true_w": inv_replace_dict, "trans_w": inv_replace_dict})
-
         aligned_df = aligned_df[aligned_df['id'].isin(word_ids)]
         return aligned_df
 
