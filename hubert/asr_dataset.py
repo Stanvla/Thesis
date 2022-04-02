@@ -19,11 +19,9 @@ from icecream import ic
 import re
 import numpy as np
 
-
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.types import TRAIN_DATALOADERS, EVAL_DATALOADERS
 from torch.utils.data import DataLoader
-import numpy as np
 
 # depending on how the script is executed, interactively or not, use different path for importing
 try:
@@ -41,26 +39,25 @@ class TranscriptAlignment:
         self.asr_transcript = asr_trans.lower()
         self.gold_transcript = gold_trans
         self.alignment = None
-
         self.abbreviation_dict = {
             '§': 'paragraf',
-            'č': 'cislo',
+            'č': 'číslo',
             'mld': 'miliarda',
             '%': 'procent',
             'tj': 'to jest',
-            'sb': 'sbirka',
+            'sb': 'sbírka',
             'cca': 'cirka',
             'odst': 'odstavec',
-            'tzv': 'takzvane',
-            'resp': 'respektive',
-            'atd': 'a tak dale',
+            'tzv': 'takzvaně',
+            'resp': 'respektivě',
+            'atd': 'a tak dále',
             'hod': 'hodin',
             'tzn': 'to znamena',
-            'apod': 'a podobne',
+            'apod': 'a podobně',
             'kč': 'korun',
             '/': 'lomeno',
             '+': 'plus',
-            '09': 'nula devet',
+            '09': 'nula devět',
         }
 
     def expand_abbr(self, word):
@@ -72,8 +69,10 @@ class TranscriptAlignment:
     def _remove_accents(trans):
         return unidecode(trans)
 
-    def custom_num2words(self, string):
-        return self._remove_accents(num2words(string, lang='cz'))
+    def custom_num2words(self, string, remove_accents=False):
+        if remove_accents:
+            return self._remove_accents(num2words(string, lang='cz'))
+        return num2words(string, lang='cz')
 
     @staticmethod
     def similarity(trans1, trans2):
@@ -85,6 +84,10 @@ class TranscriptAlignment:
         if time:
             return re.findall(r"\d+\.\d+ hodin", trans)
         return re.findall(r"\d+\.\d+", trans)
+
+    @staticmethod
+    def _find_digits(trans):
+        return re.findall(r"\d+", trans)
 
     def _float_to_words(self, float_str):
         whole, decimal = float_str.replace(' ', '').split('.')
@@ -152,6 +155,7 @@ class TranscriptAlignment:
     def _time_to_words(self, time_str, time_suffix=False):
         if time_suffix:
             time_str = time_str.replace('hodin', '')
+
         hours, minutes = time_str.replace(' ', '').split('.')
         results_dict = dict(
             hours=[self.custom_num2words(hours)],
@@ -165,20 +169,33 @@ class TranscriptAlignment:
             results_dict['minutes'].extend(self._starts_with_zero(minutes))
 
         results_list = []
-        for h in ['hodin', '']:
-            for m in ['minut', '']:
-                for h_num in results_dict['hours']:
-                    for m_num in results_dict['minutes']:
+        for h_num in results_dict['hours']:
+            for h in ['hodin', '']:
+                for m_num in results_dict['minutes']:
+                    for m in ['minut', '']:
+
+                        if m_num == '':
+                            result = f'{h_num} {h}'
+                        else:
+                            if h == '':
+                                result = f'{h_num} {m_num}'
+                            else:
+                                if h == 'hodin' and m == '':
+                                    result = f'{h_num} {m_num}'
+                                else:
+                                    result = f'{h_num} {h} {m_num} {m}'
+
                         # need to handle double white-space and white-space at the end
-                        results_list.append(f'{h_num} {h} {m_num} {m}'.replace('  ', ' ').rstrip())
+                        results_list.append(result.replace('  ', ' ').rstrip())
+
         if time_suffix:
             new_results_list = []
             for r in results_list:
                 new_results_list.append(r)
-                if not r.endswith('hodin') and not r.endswith('minut'):
+                if 'hodin' not in r and 'minut' not in r:
                     new_results_list.append(r + ' ' + 'hodin')
             results_list = new_results_list
-        return results_list
+        return list(set(results_list))
 
     def _dict_replacement(self, transcript, replace_dict, recognized):
         # replace_dict[orig_float_string1] = [verb_var_1_1, verb_var_1_2, ...]
@@ -194,7 +211,6 @@ class TranscriptAlignment:
         # combinations[i] = [verb_var_1_x1, verb_var_2_x2, ... verb_var_N_xN]
         from operator import mul
         from functools import reduce
-        ic(combinations[0])
         ic(len(combinations))
         ic(reduce(mul, [len(v) for v in replace_dict.values()], 1))
 
@@ -208,11 +224,11 @@ class TranscriptAlignment:
                 combination_split,
                 recognized_split,
                 match_fn=self.similarity,
-                open=-2,
-                extend=-1,
+                open=-3,
+                extend=0,
                 gap_char=[gap_char],
             )
-            aligned_comb, aligned_recog, _, _, _ = tmp_alignments[0]
+            aligned_comb, aligned_recog, orig_score, _, _ = tmp_alignments[0]
 
             # manually score the alignment by computing edit distance between aligned words
             acc = 0
@@ -244,10 +260,11 @@ class TranscriptAlignment:
                 replacement.append([words, ' '.join([w for _, w in aligned_comb])])
                 alignment_idx += comb_len
 
-            alignments.append([replacement, score/acc, cnt_aligned, score/acc + 0.1*cnt_aligned, score/acc + np.log2(cnt_aligned)])
+            alignments.append([replacement, score/acc, cnt_aligned, score/acc + 0.02*cnt_aligned, score/acc + np.log2(cnt_aligned), orig_score])
         score_index = 3
 
         best_alignments = sorted(alignments, key=lambda x: x[score_index], reverse=True)
+        ic(best_alignments[:5])
         best_score = best_alignments[0][score_index]
         filtered_best_alignments = []
         for alignment in best_alignments:
@@ -295,6 +312,18 @@ class TranscriptAlignment:
     def _has_numbers(trans):
         return bool(re.search(r'\d', trans))
 
+    @staticmethod
+    def _replace_with_dummy(trans, replacement_dict):
+        new_trans = trans
+        for k in replacement_dict:
+            xs = 'X' * len(k)
+            new_trans = new_trans.replace(k, xs)
+        return new_trans
+
+    @staticmethod
+    def _find_order(trans, patterns):
+        return [[p, trans.find(p)] for p in patterns]
+
     def _expand_digits(self, asr_trans, recognized_trans) -> list:
         if not self._has_numbers(asr_trans):
             return [asr_trans]
@@ -310,8 +339,37 @@ class TranscriptAlignment:
         # and then deal with pattern "XX.XX", in this case consider both floats and times
         # also there can be the same float multiple time in the transcript
 
+        patterns_order = []
+        replacement_dicts = []
+        tmp_asr_trans = asr_trans
+
+        times = self._find_floats(asr_trans, time=True)
+        if times != []:
+            ic(times)
+            patterns_order.extend(self._find_order(tmp_asr_trans, times))
+            replace_dict_times = OrderedDict((f, self._time_to_words(f, time_suffix=True)) for f in times)
+            # before finding floats need to replace time stamps with dummy strings of the same lengths
+            tmp_asr_trans = self._replace_with_dummy(tmp_asr_trans, replace_dict_times)
+            replacement_dicts.append(replace_dict_times)
+
+        floats = self._find_floats(tmp_asr_trans, time=False)
+        if floats != []:
+            ic(floats)
+            # floats can also be time
+            patterns_order.extend(self._find_order(tmp_asr_trans, floats))
+            replace_dict_floats = OrderedDict((f, self._time_to_words(f) + self._float_to_words(f)) for f in times)
+            tmp_asr_trans = self._replace_with_dummy(tmp_asr_trans, replace_dict_floats)
+            replacement_dicts.append(replace_dict_floats)
+
+        nums = self._find_digits(tmp_asr_trans)
+        if nums != []:
+            ic(nums)
+            patterns_order.extend(self._find_order(tmp_asr_trans, nums))
+            replace_dict_num = OrderedDict((n, [self.custom_num2words(n)]) for n in nums)
+            replacement_dicts.append(replace_dict_num)
+
         ic(floats)
-        results = self._transform_time(asr_trans, self._find_floats(asr_trans, time=True), recognized_trans)
+        results = self._transform_time(asr_trans, times, recognized_trans)
         # results = self._transform_floats(trans, floats)
         # results = [r for r in results if len(r.split()) == len(self.recognized_transcript.split())]
         ic(self.gold_transcript)
@@ -325,13 +383,16 @@ class TranscriptAlignment:
         # todo for each result need to transform remaining natural numbers
         return results
 
-    def _normalize_trans(self):
+    def _normalize_trans(self, remove_accents=False):
         normalized_asr = []
         for w in self.asr_transcript.split():
             norm_w = self.expand_abbr(w.lower())
-            normalized_asr.append(self._remove_accents(norm_w))
+            if remove_accents:
+                normalized_asr.append(self._remove_accents(norm_w))
+            else:
+                normalized_asr.append(norm_w)
         # floating point can be a number or time
-        return self._expand_digits(' '.join(normalized_asr), self._remove_accents(self.recognized_transcript))
+        return self._expand_digits(' '.join(normalized_asr), self.recognized_transcript)
 
     def align(self, abbrev_dict):
         pass
@@ -409,30 +470,38 @@ if __name__ == '__main__':
     loader = dataset.train_dataloader()
 
     ic(dataset.dataset.duration_hours())
-    cnt = 0
-    threshold = 2000
+    transcripts_pickle_file = '/lnet/express/work/people/stankov/alignment/transcripts.pkl'
+    ic(os.getcwd())
+    transcripts = []
+    if not os.path.isfile(transcripts_pickle_file):
+        print('reading through dataloder')
+        for batch in tqdm(loader, total=len(loader)):
+            asr_trans, gold_trans, recog_trans, paths = batch['asr_trans'], batch['gold_trans'], batch['recog_trans'], batch['path']
+            for asr, gold, recog, path in zip(asr_trans, gold_trans, recog_trans, paths):
+                transcripts.append(dict(gold=gold, asr=asr, recog=recog, path=path))
+        with open(transcripts_pickle_file, 'wb') as f:
+            pickle.dump(transcripts, f)
+    else:
+        print('unpickling')
+        with open(transcripts_pickle_file, 'rb') as f:
+            transcripts = pickle.load(f)
+
     alignments = []
-    for batch in tqdm(loader, total=len(loader)):
-        if cnt > threshold:
-            break
-
-        asr_trans, gold_trans, recog_trans, paths = batch['asr_trans'], batch['gold_trans'], batch['recog_trans'], batch['path']
-        for asr, gold, recog, path in zip(asr_trans, gold_trans, recog_trans, paths):
-            alignments.append(TranscriptAlignment(gold, asr, recog, path))
-
-        cnt += 1
-
+    for t in tqdm(transcripts):
+        alignments.append(TranscriptAlignment(t['gold'], t['asr'], t['recog'], t['path']))
     # %%
     cnt = 0
+    threshold = 10
     for a in alignments:
-        # if cnt == 3:
-        #     break
-        if re.findall(r"\d+\.\d+ hodin", a.asr_transcript) != []:
+        if cnt == threshold:
+            break
+        if len(re.findall(r"\d+\.\d+ hodin", a.asr_transcript)) > 1:
+            ic(cnt)
             a._normalize_trans()
             cnt += 1
             # ic('--'*40)
 
-    ic(cnt)
+    print(cnt)
     # %%
     # try:
     #     with open('filtered_text.pkl', 'rb') as f:
