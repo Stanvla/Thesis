@@ -5,7 +5,7 @@ import sys
 import pandas as pd
 import torch
 import torchtext
-from collections import OrderedDict
+from collections import OrderedDict, Counter
 from abc import ABC, abstractmethod
 from tqdm import tqdm
 
@@ -33,12 +33,14 @@ except ModuleNotFoundError:
 
 
 class TranscriptAlignment:
-    def __init__(self, gold_trans, asr_trans, recog_trans, path):
+    def __init__(self, gold_trans, asr_trans, recog_trans, path, max_alignment_cnt):
         self.path = path
         self.recognized_transcript = recog_trans
         self.asr_transcript = asr_trans.lower()
         self.gold_transcript = gold_trans
         self.alignment = None
+        self.gap_char = '-'
+        self.max_alignment_cnt = max_alignment_cnt
         self.abbreviation_dict = {
             '§': 'paragraf',
             'č': 'číslo',
@@ -69,10 +71,60 @@ class TranscriptAlignment:
     def _remove_accents(trans):
         return unidecode(trans)
 
-    def custom_num2words(self, string, remove_accents=False):
+    @staticmethod
+    def custom_num2words(number, remove_accents=False):
+        # number can be either int or string
+
         if remove_accents:
-            return self._remove_accents(num2words(string, lang='cz'))
-        return num2words(string, lang='cz')
+            return TranscriptAlignment._remove_accents(num2words(number, lang='cz'))
+        return num2words(number, lang='cz')
+
+    @staticmethod
+    def _num2words_21to99_special(num_int, remove_accents=False):
+        if num_int % 10 == 0:
+            return []
+
+        ones_num = num_int % 10
+        ones_str = TranscriptAlignment.custom_num2words(ones_num, remove_accents)
+
+        tens_num = (num_int % 100) - ones_num
+        tens_str = TranscriptAlignment.custom_num2words(tens_num, remove_accents)
+
+        return [
+            f'{ones_str}a{tens_str}',
+            f'{ones_str} a {tens_str}',
+        ]
+
+    @staticmethod
+    def _extended_custom_num2words(string, remove_accents=False):
+        results = [
+            TranscriptAlignment.custom_num2words(string, remove_accents)
+        ]
+        num = int(string)
+        if 20 < num:
+            residual_tens = num % 100
+            residual_high = num - residual_tens
+
+            # can be an empty list, this means that the number was a multiple of 10
+            alt_forms_tens = TranscriptAlignment._num2words_21to99_special(residual_tens, remove_accents)
+
+            for alt_f in alt_forms_tens:
+                # num > 100
+                if residual_high != 0:
+                    results.append(TranscriptAlignment.custom_num2words(residual_high) + ' ' + alt_f)
+
+            # 1100 can be jedenáct set
+            if 1100 < num < 1999:
+                alt_form_high = TranscriptAlignment.custom_num2words(residual_high // 100) + ' ' + 'set'
+                if residual_tens == 0:
+                    results.append(alt_form_high)
+                else:
+                    for alt_f in alt_forms_tens:
+                        results.extend([
+                            alt_form_high + ' ' + alt_f,
+                            alt_form_high + ' ' + TranscriptAlignment.custom_num2words(residual_tens, remove_accents)
+                        ])
+        return results
 
     @staticmethod
     def similarity(trans1, trans2):
@@ -86,8 +138,32 @@ class TranscriptAlignment:
         return re.findall(r"\d+\.\d+", trans)
 
     @staticmethod
-    def _find_digits(trans):
+    def _find_digits(trans, time=False):
+        if time:
+            return re.findall(r"\d+ hodin[y]*", trans)
         return re.findall(r"\d+", trans)
+
+    def _starts_with_zero(self, str_num):
+        zeros_cnt = 0
+        for char in str_num:
+            if char != '0':
+                break
+            zeros_cnt += 1
+
+        zeros = ' '.join(self.custom_num2words('0') for _ in range(zeros_cnt))
+        numbers = []
+        # check if the number in form that starts with zeros like 09
+        if zeros_cnt < len(str_num):
+            number_without_zeros = self.custom_num2words(str_num[zeros_cnt: len(str_num)])
+            numbers.append(zeros + ' ' + number_without_zeros)
+            # add variant with only one zero
+            if zeros_cnt > 1:
+                numbers.append(self.custom_num2words('0') + ' ' + number_without_zeros)
+        else:
+            numbers.append(zeros)
+            if zeros_cnt > 1:
+                numbers.append(self.custom_num2words('0'))
+        return numbers
 
     def _float_to_words(self, float_str):
         whole, decimal = float_str.replace(' ', '').split('.')
@@ -130,38 +206,21 @@ class TranscriptAlignment:
                         results.append(f'{wh_num} {wh} {dec_num} {dec}'.replace('  ', ' ').rstrip())
         return results
 
-    def _starts_with_zero(self, str_num):
-        zeros_cnt = 0
-        for char in str_num:
-            if char != '0':
-                break
-            zeros_cnt += 1
-
-        zeros = ' '.join(self.custom_num2words('0') for _ in range(zeros_cnt))
-        numbers = []
-        # check if the number in form that starts with zeros like 09
-        if zeros_cnt < len(str_num):
-            number_without_zeros = self.custom_num2words(str_num[zeros_cnt: len(str_num)])
-            numbers.append(zeros + ' ' + number_without_zeros)
-            # add variant with only one zero
-            if zeros_cnt > 1:
-                numbers.append(self.custom_num2words('0') + ' ' + number_without_zeros)
-        else:
-            numbers.append(zeros)
-            if zeros_cnt > 1:
-                numbers.append(self.custom_num2words('0'))
-        return numbers
-
-    def _time_to_words(self, time_str, time_suffix=False):
+    def _float_time_to_words(self, time_str, time_suffix=False):
         if time_suffix:
             time_str = time_str.replace('hodin', '')
 
         hours, minutes = time_str.replace(' ', '').split('.')
+        hours_int = int(hours)
         results_dict = dict(
             hours=[self.custom_num2words(hours)],
             # sometimes minutes are not pronounced
             minutes=['', self.custom_num2words(minutes)]
         )
+
+        if hours_int > 12:
+            results_dict['hours'].append(self.custom_num2words(f'{hours_int % 12}'))
+
         if hours.startswith('0'):
             results_dict['hours'].extend(self._starts_with_zero(hours))
 
@@ -188,6 +247,14 @@ class TranscriptAlignment:
                         # need to handle double white-space and white-space at the end
                         results_list.append(result.replace('  ', ' ').rstrip())
 
+        # handle the case for "XX.30", this can be transcribed as "půl XX"
+        if minutes == '30':
+            if hours_int >= 12:
+                hours_int_short = (hours_int % 12) + 1
+                results_list.append(f'půl {self.custom_num2words(f"{hours_int_short}")}')
+            else:
+                results_list.append(f'půl {self.custom_num2words(f"{hours_int + 1}")}')
+
         if time_suffix:
             new_results_list = []
             for r in results_list:
@@ -197,26 +264,85 @@ class TranscriptAlignment:
             results_list = new_results_list
         return list(set(results_list))
 
-    def _dict_replacement(self, transcript, replace_dict, recognized):
+    def _digit_time_to_words(self, time_str):
+        hours = re.sub(r"hodin[y]*", "", time_str)
+        results = [self.custom_num2words(hours)]
+        if int(hours) > 12:
+            results.append(self.custom_num2words(f'{int(hours)%12}'))
+        new_results = []
+        for r in results:
+            new_results.append(r)
+            new_results.append(f'{r} hodin')
+        return new_results
+
+    def _eval_alignment(self, replacement, recogized):
+        total_len = 0
+        score = 0
+        aligned_gap = False
+        cnt_aligned = 0
+        alignment = []
+        for repl, recog in zip(replacement, recogized):
+            if repl == self.gap_char:
+                continue
+            total_len += max(len(repl), len(recog))
+            score += self.similarity(repl, recog)
+            alignment.append([repl, recog])
+            cnt_aligned += 1
+            # do not want to have gaps in recognized transcript
+            if recog == self.gap_char:
+                aligned_gap = True
+                break
+        return total_len, score, aligned_gap, cnt_aligned, alignment
+
+    def _filter_replacements(self, repl_lst, recognized_split, repl_cnt):
+        alignments = []
+        for repl in repl_lst:
+            repl_split = repl.split()
+            tmp_alignments = pairwise2.align.localcs(
+                repl_split,
+                recognized_split,
+                match_fn=self.similarity,
+                open=-0.3,
+                extend=-0.1,
+                gap_char=[self.gap_char],
+            )
+            aligned_repl, aligned_recog, orig_score, _, _ = tmp_alignments[0]
+            total_len, score, aligned_gap, cnt_aligned, alignment = self._eval_alignment(aligned_repl, aligned_recog)
+            if aligned_gap:
+                continue
+
+            alignments.append([repl, score / total_len + 0.02*cnt_aligned])
+
+        best_replacements = sorted(alignments, key=lambda x: x[1], reverse=True)
+        cnt_candidates = min(self.max_alignment_cnt + repl_cnt, len(best_replacements))
+        return [repl for repl, _ in best_replacements[:cnt_candidates]]
+
+    def _apply_replacements(self, transcript, replacements, recognized):
         # replace_dict[orig_float_string1] = [verb_var_1_1, verb_var_1_2, ...]
         # len(replace_dict) = N
-
+        recognized_split = recognized.split()
         combinations = [[]]
-        for k in replace_dict:
+        replacements_dict = {}
+        repl_counter = Counter([r for r, _ in replacements])
+        for rep_key, rep_lst in replacements:
             new_combinations = []
-            for v in replace_dict[k]:
+            # it is not possible to evaluate all combinations
+            # so leave only combinations that somehow occur in the recognized transcript
+            if rep_key in replacements_dict:
+                filtered_rep_lst = replacements_dict[rep_key]
+            else:
+                filtered_rep_lst = self._filter_replacements(rep_lst, recognized_split, repl_counter[rep_key])
+                replacements_dict[rep_key] = filtered_rep_lst
+
+            for v in filtered_rep_lst:
                 for com in combinations:
                     new_combinations.append(com + [v])
             combinations = new_combinations
         # combinations[i] = [verb_var_1_x1, verb_var_2_x2, ... verb_var_N_xN]
-        from operator import mul
-        from functools import reduce
         ic(len(combinations))
-        ic(reduce(mul, [len(v) for v in replace_dict.values()], 1))
+        ic(replacements_dict)
 
         alignments = []
-        recognized_split = recognized.split()
-        gap_char = '-'
         for combination in combinations:
             # align combination to the recognized transcript
             combination_split = [w for words in combination for w in words.split()]
@@ -224,28 +350,14 @@ class TranscriptAlignment:
                 combination_split,
                 recognized_split,
                 match_fn=self.similarity,
-                open=-3,
-                extend=0,
-                gap_char=[gap_char],
+                open=-0.3,
+                extend=-0.1,
+                gap_char=[self.gap_char],
             )
             aligned_comb, aligned_recog, orig_score, _, _ = tmp_alignments[0]
 
             # manually score the alignment by computing edit distance between aligned words
-            acc = 0
-            score = 0
-            alignment = []
-            aligned_gap = False
-            cnt_aligned = 0
-            for ac, ar in zip(aligned_comb, aligned_recog):
-                if ac == gap_char:
-                    continue
-                acc += max(len(ac), len(ar))
-                score += self.similarity(ac, ar)
-                alignment.append([ac, ar])
-                cnt_aligned += 1
-                if ar == gap_char:
-                    aligned_gap = True
-                    break
+            total_len, score, aligned_gap, cnt_aligned, alignment = self._eval_alignment(aligned_comb, aligned_recog)
 
             if aligned_gap:
                 continue
@@ -260,11 +372,10 @@ class TranscriptAlignment:
                 replacement.append([words, ' '.join([w for _, w in aligned_comb])])
                 alignment_idx += comb_len
 
-            alignments.append([replacement, score/acc, cnt_aligned, score/acc + 0.02*cnt_aligned, score/acc + np.log2(cnt_aligned), orig_score])
+            alignments.append([replacement, score/total_len, cnt_aligned, score/total_len + 0.02*cnt_aligned, orig_score])
         score_index = 3
 
         best_alignments = sorted(alignments, key=lambda x: x[score_index], reverse=True)
-        ic(best_alignments[:5])
         best_score = best_alignments[0][score_index]
         filtered_best_alignments = []
         for alignment in best_alignments:
@@ -279,59 +390,43 @@ class TranscriptAlignment:
         new_transcripts = []
         for best_alignment in filtered_best_alignments:
             new_transcript = transcript
-            for key, value in zip(replace_dict, best_alignment[0]):
-                new_transcript = new_transcript.replace(key, value[1].upper())
+            for (key, _), value in zip(replacements, best_alignment[0]):
+                new_transcript = new_transcript.replace(key, value[1].upper(), 1)
             new_transcripts.append(new_transcript)
         return new_transcripts
-
-    def _transform_floats(self, trans, floats):
-        replace_dict_floats = OrderedDict((f, self._float_to_words(f)) for f in floats)
-        replace_dict_times = OrderedDict((f, self._time_to_words(f)) for f in floats)
-        replace_dict = {}
-        for f in floats:
-            replace_dict[f] = replace_dict_floats[f] + replace_dict_times[f]
-        return self._dict_replacement(trans, replace_dict)
-
-    def _transform_time(self, trans, times, recognized):
-        replace_dict_times = OrderedDict((f, self._time_to_words(f, time_suffix=True)) for f in times)
-        return self._dict_replacement(trans, replace_dict_times, recognized)
-
-    def _transform_natural_num(self, trans):
-        results = []
-        for t in trans:
-            new_t = []
-            for w in t.split():
-                if w.isdigit():
-                    new_t.append(self.custom_num2words(w))
-                else:
-                    new_t.append(w)
-            results.append(' '.join(new_t))
-        return results
 
     @staticmethod
     def _has_numbers(trans):
         return bool(re.search(r'\d', trans))
 
     @staticmethod
-    def _replace_with_dummy(trans, replacement_dict):
+    def _find_order(trans, patterns):
         new_trans = trans
-        for k in replacement_dict:
-            xs = 'X' * len(k)
-            new_trans = new_trans.replace(k, xs)
-        return new_trans
+        result = []
+        for p in patterns:
+            order = new_trans.find(p)
+            result.append([p, order])
+            dummy = 'X' * len(p)
+            # replace the first occurrence
+            new_trans = new_trans.replace(p, dummy, 1)
+        return result, new_trans
 
     @staticmethod
-    def _find_order(trans, patterns):
-        return [[p, trans.find(p)] for p in patterns]
+    def _merge_replacements(replacements, patterns):
+        ordered_patterns = sorted(patterns, key=lambda x: x[1])
+        ordered_replacements = []
+        for p, _ in ordered_patterns:
+            for replacement in replacements:
+                for rep_key, rep_lst in replacement:
+                    if rep_key == p:
+                        ordered_replacements.append((rep_key, rep_lst))
+                        break
+        return ordered_replacements, ordered_patterns
 
     def _expand_digits(self, asr_trans, recognized_trans) -> list:
         if not self._has_numbers(asr_trans):
             return [asr_trans]
 
-        # handles floating point numbers, natural numbers, times
-        floats = self._find_floats(asr_trans, time=False)
-        if floats == []:
-            return self._transform_natural_num([asr_trans])
         # some floats found, can be either real numbers or time
         # now need to deal with time and floats
         # the problem is that time can be written as "XX.XX hodin" and also as "XX.XX"
@@ -340,47 +435,52 @@ class TranscriptAlignment:
         # also there can be the same float multiple time in the transcript
 
         patterns_order = []
-        replacement_dicts = []
+        replacements = []
         tmp_asr_trans = asr_trans
 
-        times = self._find_floats(asr_trans, time=True)
-        if times != []:
-            ic(times)
-            patterns_order.extend(self._find_order(tmp_asr_trans, times))
-            replace_dict_times = OrderedDict((f, self._time_to_words(f, time_suffix=True)) for f in times)
-            # before finding floats need to replace time stamps with dummy strings of the same lengths
-            tmp_asr_trans = self._replace_with_dummy(tmp_asr_trans, replace_dict_times)
-            replacement_dicts.append(replace_dict_times)
+        times_float = self._find_floats(asr_trans, time=True)
+        if times_float != []:
+            times_order, tmp_asr_trans = self._find_order(tmp_asr_trans, times_float)
+            patterns_order.extend(times_order)
+            time_replacement = [(f, self._float_time_to_words(f, time_suffix=True)) for f in times_float]
+            replacements.append(time_replacement)
 
+        # floats can also be time
         floats = self._find_floats(tmp_asr_trans, time=False)
         if floats != []:
-            ic(floats)
-            # floats can also be time
-            patterns_order.extend(self._find_order(tmp_asr_trans, floats))
-            replace_dict_floats = OrderedDict((f, self._time_to_words(f) + self._float_to_words(f)) for f in times)
-            tmp_asr_trans = self._replace_with_dummy(tmp_asr_trans, replace_dict_floats)
-            replacement_dicts.append(replace_dict_floats)
+            floats_order, tmp_asr_trans = self._find_order(tmp_asr_trans, floats)
+            patterns_order.extend(floats_order)
+            float_replacement = [(f, self._float_time_to_words(f) + self._float_to_words(f)) for f in floats]
+            replacements.append(float_replacement)
+
+        # even natural numbers can be time
+        nums_time = self._find_digits(tmp_asr_trans, time=True)
+        if nums_time != []:
+            nums_time_order, tmp_asr_trans = self._find_order(tmp_asr_trans, nums_time)
+            patterns_order.extend(nums_time_order)
+            num_time_replacement = [(n, self._digit_time_to_words(n)) for n in nums_time]
+            replacements.append(num_time_replacement)
 
         nums = self._find_digits(tmp_asr_trans)
         if nums != []:
-            ic(nums)
-            patterns_order.extend(self._find_order(tmp_asr_trans, nums))
-            replace_dict_num = OrderedDict((n, [self.custom_num2words(n)]) for n in nums)
-            replacement_dicts.append(replace_dict_num)
+            nums_order, _ = self._find_order(tmp_asr_trans, nums)
+            patterns_order.extend(nums_order)
+            num_replacement = [(n, [self.custom_num2words(n)]) for n in nums]
+            replacements.append(num_replacement)
 
-        ic(floats)
-        results = self._transform_time(asr_trans, times, recognized_trans)
-        # results = self._transform_floats(trans, floats)
-        # results = [r for r in results if len(r.split()) == len(self.recognized_transcript.split())]
+        replacements, ordered_patterns = self._merge_replacements(replacements, patterns_order)
+        ic(ordered_patterns)
+
         ic(self.gold_transcript)
-        ic(self.asr_transcript)
         ic(asr_trans)
         ic(self.recognized_transcript)
+
+        results = self._apply_replacements(asr_trans, replacements, recognized_trans)
+
         # ic(result)
         for r in results:
             ic(r)
         ic('--' * 40)
-        # todo for each result need to transform remaining natural numbers
         return results
 
     def _normalize_trans(self, remove_accents=False):
@@ -488,20 +588,112 @@ if __name__ == '__main__':
 
     alignments = []
     for t in tqdm(transcripts):
-        alignments.append(TranscriptAlignment(t['gold'], t['asr'], t['recog'], t['path']))
+        alignments.append(TranscriptAlignment(t['gold'], t['asr'], t['recog'], t['path'], 2))
     # %%
+
+    def transform_date(date_str):
+        # 1 první
+        # 2 druhý
+        # 3 třetí
+        # 4 čtvrtý
+        # 5 pátý
+        # 6 šestý
+        # 7 sedmý
+        # 8	osmý
+        # 9 devátý
+        # 10 desátý
+        # 11 jedenáctý
+        # 12 dvanáctý
+        # 13 třináctý
+        # 14 čtrnáctý
+        # 15 patnáctý
+        # 16 šestnáctý
+        # 17 sedmnáctý
+        # 18 osmnáctý
+        # 19 devatenáctý
+        # 20 dvacátý
+        #
+        # 21	jednadvacet, jedenadvacet, dvacet jeden, dvacet jedna	jednadvacátý, jedenadvacátý, dvacátý první, dvacátý prvý
+        # 22	dvaadvacet, dvacet dva	dvaadvacátý, dvacátý druhý
+        # 23	třiadvacet, dvacet tři	třiadvacátý, dvacátý třetí
+        # 24	čtyřiadvacet, dvacet čtyři	čtyřiadvacátý, dvacátý čtvrtý
+        # 25	pětadvacet, dvacet pět	pětadvacátý, dvacátý pátý
+        # 26	šestadvacet, dvacet šest	šestadvacátý, dvacátý šestý
+        # 27	sedmadvacet, dvacet sedm	sedmadvacátý, dvacátý sedmý
+        # 28	osmadvacet, dvacet osm	osmadvacátý, dvacátý osmý
+        # 29	devětadvacet, dvacet devět	devětadvacátý, dvacátý devátý
+        # 30	třicet	třicátý
+
+        replacement_dict_day = {
+            '1': [num2words('1', lang='cz'), ' první',],
+            '2': [num2words('2', lang='cz'), ' druhý',],
+            '3': [num2words('3', lang='cz'), ' třetí',],
+            '4': [num2words('4', lang='cz'), ' čtvrtý', ],
+            '5': [num2words('5', lang='cz'), ' pátý', ],
+            '6': [num2words('6', lang='cz'), ' šestý', ],
+            '7': [num2words('7', lang='cz'), ' sedmý', ],
+            '8': [num2words('8', lang='cz'), '	osmý', ],
+            '9': [num2words('9', lang='cz'), ' devátý', ],
+            '10': [num2words('10', lang='cz'), ' desátý', ],
+            '11': [num2words('11', lang='cz'), ' jedenáctý', ],
+            '12': [num2words('12', lang='cz'), ' dvanáctý', ],
+            '13': [num2words('13', lang='cz'), ' třináctý', ],
+            '14': [num2words('14', lang='cz'), ' čtrnáctý', ],
+            '15': [num2words('15', lang='cz'), ' patnáctý', ],
+            '16': [num2words('16', lang='cz'), ' šestnáctý', ],
+            '17': [num2words('17', lang='cz'), ' sedmnáctý', ],
+            '18': [num2words('18', lang='cz'), ' osmnáctý', ],
+            '19': [num2words('19', lang='cz'), ' devatenáctý', ],
+            '20': [num2words('20', lang='cz'), ' dvacátý', ],
+            '21': [num2words('21', lang='cz'), ],
+            '22': [num2words('22', lang='cz'), ],
+            '23': [num2words('23', lang='cz'), ],
+            '24': [num2words('24', lang='cz'), ],
+            '25': [num2words('25', lang='cz'), ],
+            '26': [num2words('26', lang='cz'), ],
+            '27': [num2words('27', lang='cz'), ],
+            '28': [num2words('28', lang='cz'), ],
+            '29': [num2words('29', lang='cz'), ],
+            '30': [num2words('30', lang='cz'), ],
+            '31': [num2words('31', lang='cz'), ],
+        }
+        return None
+
+
+    # todo
+    #   Číslovky 1100–1999 můžeme alternativně tvořit jako počet stovek, což se využívá zejména při uvádění letopočtů:
+    #   1100 = tisíc sto = jedenáct set
+
+    weired_numbers = [f'{TranscriptAlignment.custom_num2words(i)} set' for i in range(20, 90)]
+    # ic(weired_numbers)
     cnt = 0
-    threshold = 10
+    threshold = 10000
+    recognized_weired = []
     for a in alignments:
         if cnt == threshold:
             break
-        if len(re.findall(r"\d+\.\d+ hodin", a.asr_transcript)) > 1:
+        # if len(re.findall(r"\d+\.\d+ hodin", a.asr_transcript)) > 1:
+        # patterns = re.findall(r"\d+\s+\.\s[\s]*\d+\s*\.*\s*\d*", a.gold_transcript)
+        # numbers = TranscriptAlignment._find_floats(a.asr_transcript)
+        patterns = [n for n in weired_numbers if n in a.recognized_transcript]
+        if patterns != []:
+            recognized_weired.extend(patterns)
+            # ic(numbers)
+            ic(patterns)
+            ic(a.gold_transcript)
+            ic(a.asr_transcript)
+            recognized_transcript = a.recognized_transcript
+            for p in patterns:
+                recognized_transcript = recognized_transcript.replace(p, f'___{p.upper()}___', 1)
+            ic(recognized_transcript)
             ic(cnt)
-            a._normalize_trans()
+            # a._normalize_trans()
             cnt += 1
-            # ic('--'*40)
+            ic('--'*40)
 
+    ic(Counter(recognized_weired))
     print(cnt)
+
     # %%
     # try:
     #     with open('filtered_text.pkl', 'rb') as f:
