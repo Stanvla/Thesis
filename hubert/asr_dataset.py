@@ -32,13 +32,14 @@ except ModuleNotFoundError:
     from hubert.clustering.torch_mffc_extract import ParCzechDataset
 
 
-class TranscriptAlignment:
+class TransNorm:
     def __init__(self, gold_trans, asr_trans, recog_trans, path, max_alignment_cnt):
         self.path = path
         self.recognized_transcript = recog_trans
         self.asr_transcript = asr_trans.lower()
         self.gold_transcript = gold_trans
         self.alignment = None
+        self.normalized = []
         self.gap_char = '-'
         self.max_alignment_cnt = max_alignment_cnt
         self.abbreviation_dict = {
@@ -61,6 +62,23 @@ class TranscriptAlignment:
             '+': 'plus',
             '09': 'nula devět',
         }
+    @staticmethod
+    def _custom_distance(s1, s2):
+        replacement_dict = {
+            'á': 'a',
+
+            'é': 'e',
+
+            'í': 'i',
+            'y': 'i',
+            'ý': 'i',
+
+            'ú': 'u',
+            'ů': 'u',
+
+            'ó': 'o',
+        }
+        pass
 
     def expand_abbr(self, word):
         if word in self.abbreviation_dict:
@@ -76,7 +94,7 @@ class TranscriptAlignment:
         # number can be either int or string
 
         if remove_accents:
-            return TranscriptAlignment._remove_accents(num2words(number, lang='cz'))
+            return TransNorm._remove_accents(num2words(number, lang='cz'))
         return num2words(number, lang='cz')
 
     @staticmethod
@@ -85,10 +103,10 @@ class TranscriptAlignment:
             return []
 
         ones_num = num_int % 10
-        ones_str = TranscriptAlignment.custom_num2words(ones_num, remove_accents)
+        ones_str = TransNorm.custom_num2words(ones_num, remove_accents)
 
         tens_num = (num_int % 100) - ones_num
-        tens_str = TranscriptAlignment.custom_num2words(tens_num, remove_accents)
+        tens_str = TransNorm.custom_num2words(tens_num, remove_accents)
 
         return [
             f'{ones_str}a{tens_str}',
@@ -98,7 +116,7 @@ class TranscriptAlignment:
     @staticmethod
     def _extended_custom_num2words(string, remove_accents=False):
         results = [
-            TranscriptAlignment.custom_num2words(string, remove_accents)
+            TransNorm.custom_num2words(string, remove_accents)
         ]
         num = int(string)
         if 20 < num:
@@ -106,24 +124,29 @@ class TranscriptAlignment:
             residual_high = num - residual_tens
 
             # can be an empty list, this means that the number was a multiple of 10
-            alt_forms_tens = TranscriptAlignment._num2words_21to99_special(residual_tens, remove_accents)
+            alt_forms_tens = TransNorm._num2words_21to99_special(residual_tens, remove_accents)
 
             for alt_f in alt_forms_tens:
                 # num > 100
                 if residual_high != 0:
-                    results.append(TranscriptAlignment.custom_num2words(residual_high) + ' ' + alt_f)
+                    results.append(TransNorm.custom_num2words(residual_high) + ' ' + alt_f)
+                else:
+                    results.append(alt_f)
 
             # 1100 can be jedenáct set
             if 1100 < num < 1999:
-                alt_form_high = TranscriptAlignment.custom_num2words(residual_high // 100) + ' ' + 'set'
+                alt_form_high = TransNorm.custom_num2words(residual_high // 100) + ' ' + 'set'
                 if residual_tens == 0:
                     results.append(alt_form_high)
                 else:
                     for alt_f in alt_forms_tens:
                         results.extend([
                             alt_form_high + ' ' + alt_f,
-                            alt_form_high + ' ' + TranscriptAlignment.custom_num2words(residual_tens, remove_accents)
+                            alt_form_high + ' ' + TransNorm.custom_num2words(residual_tens, remove_accents)
                         ])
+
+            if 1000 < num < 10000:
+                results.append(TransNorm.custom_num2words(residual_high // 100) + ' ' + TransNorm.custom_num2words(residual_tens))
         return results
 
     @staticmethod
@@ -131,11 +154,95 @@ class TranscriptAlignment:
         return max(len(trans1), len(trans2)) - distance(trans1, trans2)
 
     @staticmethod
-    def _find_floats(trans, time=False):
+    def _find_dates(gold):
+        tmp_results = [x.rstrip() for x in re.findall(r'\d+\s\.\s\d+\s\.\s*\d*', gold)]
+        # replace dots and double ws
+        tmp_results = [x.replace('.', '').replace('  ', ' ').rstrip() for x in tmp_results]
+        results = []
+        for x in tmp_results:
+            if len(x.split()) == 2:
+                day, month = x.split()
+            else:
+                day, month, year = x.split()
+
+            if 0 < int(day) < 32 and 0 < int(month) < 13:
+                results.append(x)
+        return results
+
+
+    @staticmethod
+    def _find_times(trans, time=False):
         # \d is digit
         if time:
             return re.findall(r"\d+\.\d+ hodin", trans)
         return re.findall(r"\d+\.\d+", trans)
+
+    @staticmethod
+    def _find_floats(gold):
+        def clean_floats_and_str(floats_lst, source_str, extra_str=''):
+            clean_results = []
+            for f in floats_lst:
+                dummy = 'X'*len(f)
+                source_str = source_str.replace(f, dummy, 1)
+                if extra_str != '':
+                    f = f.replace(extra_str, '')
+                clean_results.append(f.replace(', ', ''))
+            return clean_results, source_str
+
+        float_base_regex = r'\d+\s,\s\d+'
+        if re.findall(float_base_regex, gold) == []:
+            return [], []
+
+        regex_prefix = [
+            'deficit', 'těch', 'minus', 'kolem', 'výši', 'nebo', 'bude', 'než',
+            'ani', 'plat', 'nějaké', 'úvazek', 'nadýchal', 'plnění', 'hodnoty',
+            'hranici', 'mezi', 'tam', 'nad', 'měli', ' ze', 'nejsou', 'PM',
+            'asi', 'na', 'být', 'je', ' na', ' z', ' od', ' do', ' mezi',
+            'částkou', 'současných', 'tolerance', 'činit', 'růst', 'krát',
+            'koeficientu', 'koeficientem', 'koeficient', 'koeficient na',
+            'tempo', 'průměrně', 'plocha', 'plus', 'hodnotu', 'násobku',
+            'přebytek', 'čísle', 'komise', 'průmysl', 'Proč', 'prostě',
+            'rozpočtováno', 'utraceno', 'vybírám',
+        ]
+
+        regex_suffix = [
+            'řádku', 'dny', 'exekuce', 'průměrné', 'gramu', 'GHz', 'decibelu',
+            'mld', 'miliardy', 'milionu', 'mil .', 'mil ', '%', 'procentní',
+            'tisíce',  'stupně', 'krát', 'prac', 'Kč', 'promile', 'metru',
+            'tis ', 'bili', 'náso', 'hod', 'letech', 'do', 'desetinásobku',
+            'bil ', 'hrubé', 'procenta', 'roku', 'HDP', 'dne ', 'miliony',
+            'km', 'miliony', 'kilometru', 'minuty', 'měsíce', 'měsících',
+            'tuny', 'miliarda', 'koruny', 'dítěte', 'eura', 'megawattu',
+            'týdne', 'za ', 'až',
+        ]
+
+        gold = gold.lower()
+        raw_results = re.findall(r"\s(0\s,\s\d+)", gold)
+        results, gold = clean_floats_and_str(re.findall(r"\s(0\s,\s\d+)", gold), gold)
+
+        for suffix in regex_suffix:
+            suffix = ' ' + suffix
+            suffix_regex = float_base_regex + suffix
+            tmp_results = re.findall(suffix_regex, gold)
+            raw_results.extend(tmp_results)
+            tmp_results, gold = clean_floats_and_str(tmp_results, gold, suffix)
+            results.extend(tmp_results)
+
+        for prefix in regex_prefix:
+            prefix = prefix + ' '
+            prefix_regex = prefix + float_base_regex
+            tmp_results = re.findall(prefix_regex, gold)
+            raw_results.extend(tmp_results)
+            tmp_results, gold = clean_floats_and_str(tmp_results, gold, prefix)
+            results.extend(tmp_results)
+
+        # handle if the string starts with float
+        tmp_results = [x for x in re.findall(float_base_regex, gold) if gold.startswith(x)]
+        raw_results.extend(tmp_results)
+        tmp_results, _ = clean_floats_and_str(tmp_results, gold)
+        results.extend(tmp_results)
+
+        return results
 
     @staticmethod
     def _find_digits(trans, time=False):
@@ -166,7 +273,7 @@ class TranscriptAlignment:
         return numbers
 
     def _float_to_words(self, float_str):
-        whole, decimal = float_str.replace(' ', '').split('.')
+        whole, decimal = float_str.lstrip().rstrip().replace(' ', '.').split('.')
         result_dict = dict(
             whole=[self.custom_num2words(whole)],
             decimal=[self.custom_num2words(decimal)]
@@ -183,19 +290,29 @@ class TranscriptAlignment:
         #   '1.001' = 'jedna carka nula nula jedna'
         #   '1.001' = 'jedna carka jedna tisicina'
 
+        recognized_key_words = [
+            'půl', 'celé', 'celá', 'celý' 'celých', 'celém',
+        ]
+        if int(whole) == 0:
+            result_dict['whole'].append('žádná')
+
+
         if decimal.startswith('0'):
             # _starts_with_zero returns multiple variants, only first variant does not ignore number of zeros
             result_dict['decimal'].append(self._starts_with_zero(decimal)[0])
-        whole_words = ['cela', 'tecka', 'carka', '']
-        decimal_words = []
+        whole_words = ['celé', 'celá', 'celý', 'tečka', 'čárka', '']
+        decimal_words = ['']
 
         if len(decimal) == 1:
-            decimal_words.extend(['desetina', 'desitiny', 'desetin'])
+            # decimal_words.extend(['desetina', 'desitiny', 'desetin'])
+            decimal_words.append('desetin')
         elif len(decimal) == 2:
-            decimal_words.extend(['setina', 'setiny', 'setin'])
+            # decimal_words.extend(['setina', 'setiny', 'setin'])
+            decimal_words.append('setin')
             pass
         elif len(decimal) == 3:
-            decimal_words.extend(['tisicina', 'tisiciny', 'tisicin'])
+            # decimal_words.extend(['tisicina', 'tisiciny', 'tisicin'])
+            decimal_words.append('tisícin')
         else:
             NotImplementedError('Handling decimal parts smaller than .001 is not implemented yet.')
         results = []
@@ -266,7 +383,7 @@ class TranscriptAlignment:
 
     def _digit_time_to_words(self, time_str):
         hours = re.sub(r"hodin[y]*", "", time_str)
-        results = [self.custom_num2words(hours)]
+        results = self._extended_custom_num2words(hours)
         if int(hours) > 12:
             results.append(self.custom_num2words(f'{int(hours)%12}'))
         new_results = []
@@ -324,6 +441,7 @@ class TranscriptAlignment:
         combinations = [[]]
         replacements_dict = {}
         repl_counter = Counter([r for r, _ in replacements])
+        ic(replacements)
         for rep_key, rep_lst in replacements:
             new_combinations = []
             # it is not possible to evaluate all combinations
@@ -350,7 +468,7 @@ class TranscriptAlignment:
                 combination_split,
                 recognized_split,
                 match_fn=self.similarity,
-                open=-0.3,
+                open=-0.9,
                 extend=-0.1,
                 gap_char=[self.gap_char],
             )
@@ -438,34 +556,42 @@ class TranscriptAlignment:
         replacements = []
         tmp_asr_trans = asr_trans
 
-        times_float = self._find_floats(asr_trans, time=True)
-        if times_float != []:
-            times_order, tmp_asr_trans = self._find_order(tmp_asr_trans, times_float)
+        # `XX.XX hodin[y]`
+        explicit_times_float = self._find_times(asr_trans, time=True)
+        if explicit_times_float != []:
+            times_order, tmp_asr_trans = self._find_order(tmp_asr_trans, explicit_times_float)
             patterns_order.extend(times_order)
-            time_replacement = [(f, self._float_time_to_words(f, time_suffix=True)) for f in times_float]
+            time_replacement = [(f, self._float_time_to_words(f, time_suffix=True)) for f in explicit_times_float]
             replacements.append(time_replacement)
 
-        # floats can also be time
-        floats = self._find_floats(tmp_asr_trans, time=False)
-        if floats != []:
-            floats_order, tmp_asr_trans = self._find_order(tmp_asr_trans, floats)
+        # words of the form `XX.XX` are times
+        hidden_times_float = self._find_times(tmp_asr_trans, time=False)
+        if hidden_times_float != []:
+            floats_order, tmp_asr_trans = self._find_order(tmp_asr_trans, hidden_times_float)
             patterns_order.extend(floats_order)
-            float_replacement = [(f, self._float_time_to_words(f) + self._float_to_words(f)) for f in floats]
+            float_replacement = [(f, self._float_time_to_words(f)) for f in hidden_times_float]
             replacements.append(float_replacement)
 
+        # todo
+        #  words of the form `XX , XX` are possibly floats
+
         # even natural numbers can be time
-        nums_time = self._find_digits(tmp_asr_trans, time=True)
-        if nums_time != []:
-            nums_time_order, tmp_asr_trans = self._find_order(tmp_asr_trans, nums_time)
+        time_num = self._find_digits(tmp_asr_trans, time=True)
+        if time_num != []:
+            nums_time_order, tmp_asr_trans = self._find_order(tmp_asr_trans, time_num)
             patterns_order.extend(nums_time_order)
-            num_time_replacement = [(n, self._digit_time_to_words(n)) for n in nums_time]
+            num_time_replacement = [(n, self._digit_time_to_words(n)) for n in time_num]
             replacements.append(num_time_replacement)
+
+        # todo
+        #  large numbers of order millions/milliards are written in the form `12 495 071`
+        #  need to remove spaces
 
         nums = self._find_digits(tmp_asr_trans)
         if nums != []:
             nums_order, _ = self._find_order(tmp_asr_trans, nums)
             patterns_order.extend(nums_order)
-            num_replacement = [(n, [self.custom_num2words(n)]) for n in nums]
+            num_replacement = [(n, self._extended_custom_num2words(n)) for n in nums]
             replacements.append(num_replacement)
 
         replacements, ordered_patterns = self._merge_replacements(replacements, patterns_order)
@@ -493,9 +619,6 @@ class TranscriptAlignment:
                 normalized_asr.append(norm_w)
         # floating point can be a number or time
         return self._expand_digits(' '.join(normalized_asr), self.recognized_transcript)
-
-    def align(self, abbrev_dict):
-        pass
 
 
 class ParCzechSpeechRecDataset(ParCzechDataset):
@@ -588,7 +711,7 @@ if __name__ == '__main__':
 
     alignments = []
     for t in tqdm(transcripts):
-        alignments.append(TranscriptAlignment(t['gold'], t['asr'], t['recog'], t['path'], 2))
+        alignments.append(TransNorm(t['gold'], t['asr'], t['recog'], t['path'], 2))
     # %%
 
     def transform_date(date_str):
@@ -659,40 +782,47 @@ if __name__ == '__main__':
         }
         return None
 
+    # 0 , 5 promile ... nula pět promile
+    # původních nějakých 6 , 50 Kč na až nějakých 12 , 50 Kč ... způvodních nějakých šest korun padesáti na až nějakých dvanáct korunu padesát
+    # 54 , 58 Kč ... padesát čtyři korun padesát osm ale čtú
+    # 0 , 3 násobku ... nula tři násobku
+    # 0 , 66 %  ... nula šedesát šest procent
+    # o 0 , 1 % ... ojednu desetinu procenta
+    # na 0 , 1 % z tržeb ...  na jednu desetinu procento
+    # a 23 , 58 % ... dvacet třicet i padesát osm procent ..289
+    #  0 , 2 % ... dvě desetiny procenta
+    # 0 , 75 % nula sedmdesát pět procenta
 
-    # todo
-    #   Číslovky 1100–1999 můžeme alternativně tvořit jako počet stovek, což se využívá zejména při uvádění letopočtů:
-    #   1100 = tisíc sto = jedenáct set
+    # for % need to filter
+    #   \d0\s\d0, ... 50,30 procent
+    #   also first number should be smaller than 100
 
-    weired_numbers = [f'{TranscriptAlignment.custom_num2words(i)} set' for i in range(20, 90)]
-    # ic(weired_numbers)
+    # 0,1 – nula/žádná celá jedna (desetina)
+
+    # jedenapůl
+    # 0 , 0001 procenta
+    # 72 202 hektarů in gold and asr
+    # 7 600 korunami
+    # cm
+    # : ku
     cnt = 0
-    threshold = 10000
-    recognized_weired = []
+    times_cnt = 0
+    float_cnt = 0
+    date_cnt = 0
+    nums_cnt = 0
     for a in alignments:
-        if cnt == threshold:
-            break
-        # if len(re.findall(r"\d+\.\d+ hodin", a.asr_transcript)) > 1:
-        # patterns = re.findall(r"\d+\s+\.\s[\s]*\d+\s*\.*\s*\d*", a.gold_transcript)
-        # numbers = TranscriptAlignment._find_floats(a.asr_transcript)
-        patterns = [n for n in weired_numbers if n in a.recognized_transcript]
-        if patterns != []:
-            recognized_weired.extend(patterns)
-            # ic(numbers)
-            ic(patterns)
-            ic(a.gold_transcript)
-            ic(a.asr_transcript)
-            recognized_transcript = a.recognized_transcript
-            for p in patterns:
-                recognized_transcript = recognized_transcript.replace(p, f'___{p.upper()}___', 1)
-            ic(recognized_transcript)
-            ic(cnt)
-            # a._normalize_trans()
-            cnt += 1
-            ic('--'*40)
+        if not a._has_numbers(a.asr_transcript):
+            continue
+        nums_cnt += 1
+        if a._find_dates(a.gold_transcript):
+            date_cnt +=1
+        if a._find_floats(a.gold_transcript):
+            float_cnt += 1
+        if a._find_times(a.asr_transcript):
+            times_cnt += 1
 
-    ic(Counter(recognized_weired))
-    print(cnt)
+
+
 
     # %%
     # try:
@@ -755,26 +885,6 @@ if __name__ == '__main__':
 
     # %%
     # %%
-    # %%
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     # %%
 
 
