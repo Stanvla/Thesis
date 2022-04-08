@@ -191,7 +191,7 @@ class TransNorm:
 
         float_base_regex = r'\d+\s,\s\d+'
         if re.findall(float_base_regex, gold) == []:
-            return [], []
+            return []
 
         regex_prefix = [
             'deficit', 'těch', 'minus', 'kolem', 'výši', 'nebo', 'bude', 'než',
@@ -236,11 +236,12 @@ class TransNorm:
             tmp_results, gold = clean_floats_and_str(tmp_results, gold, prefix)
             results.extend(tmp_results)
 
+        #  [['36 46'], '36 , 46 !'],
         # handle if the string starts with float
         tmp_results = [x for x in re.findall(float_base_regex, gold) if gold.startswith(x)]
         raw_results.extend(tmp_results)
         tmp_results, _ = clean_floats_and_str(tmp_results, gold)
-        results.extend(tmp_results)
+        results.append(tmp_results)
 
         return results
 
@@ -283,12 +284,6 @@ class TransNorm:
         #
         #   '1.001' = 'jedna cela nula nula jedna'
         #   '1.001' = 'jedna cela jedna tisicina'
-        #
-        #   '1.001' = 'jedna tecka nula nula jedna'
-        #   '1.001' = 'jedna tecka jedna tisicina'
-        #
-        #   '1.001' = 'jedna carka nula nula jedna'
-        #   '1.001' = 'jedna carka jedna tisicina'
 
         recognized_key_words = [
             'půl', 'celé', 'celá', 'celý' 'celých', 'celém',
@@ -798,6 +793,19 @@ if __name__ == '__main__':
     #   also first number should be smaller than 100
 
     # 0,1 – nula/žádná celá jedna (desetina)
+    # Dále můžeme desetinné číslo přečíst pomocí desetin, setin, tisícin:
+    #
+    # 0,1	=	„jedna desetina“
+    # 0,01	=	„jedna setina“
+    # 0,001	=	„jedna tisícina“
+    # 3,4	=	„tři a čtyři desetiny“
+    # 0,25	=	„dvě desetiny a pět setin“ = „dvacet pět setin“
+    # 42,007	=	„čtyřicet dva a sedm tisícin“
+    # Někdy také desitinné číslo můžeme pojmenovat podle zlomku, který mu přísluší:
+    #
+    # 0,5	=	„jedna polovina“
+    # 3,5	=	„tři a půl“
+    # 0,25	=	„jedna čtvrtina“
 
     # jedenapůl
     # 0 , 0001 procenta
@@ -805,24 +813,20 @@ if __name__ == '__main__':
     # 7 600 korunami
     # cm
     # : ku
-    cnt = 0
-    times_cnt = 0
-    float_cnt = 0
-    date_cnt = 0
+    times_lst = []
+    float_lst = []
+    date_lst = []
     nums_cnt = 0
     for a in alignments:
         if not a._has_numbers(a.asr_transcript):
             continue
         nums_cnt += 1
         if a._find_dates(a.gold_transcript):
-            date_cnt +=1
-        if a._find_floats(a.gold_transcript):
-            float_cnt += 1
+            date_lst.append([a._find_dates(a.gold_transcript), a.gold_transcript])
         if a._find_times(a.asr_transcript):
-            times_cnt += 1
-
-
-
+            times_lst.append([a._find_times(a.asr_transcript), a.gold_transcript])
+        if a._find_floats(a.gold_transcript):
+            float_lst.append([a._find_floats(a.gold_transcript), a.gold_transcript])
 
     # %%
     # try:
