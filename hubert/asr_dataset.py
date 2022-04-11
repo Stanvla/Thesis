@@ -154,18 +154,43 @@ class TransNorm:
         return max(len(trans1), len(trans2)) - distance(trans1, trans2)
 
     @staticmethod
+    def _find_month_dates(gold):
+        months = [
+            'led',
+            'únor',
+            'břez',
+            'dub',
+            'květ',
+            'červ',
+            'červen',
+            'srp',
+            'září',
+            'říj',
+            'listopad',
+            'prosin',
+        ]
+        results = []
+        for m in months:
+            for r in re.findall(r'\d+\s\.\s' + m, gold):
+                results.append(r.replace(f' . {m}', ''))
+        return results
+
+    @staticmethod
     def _find_dates(gold):
         tmp_results = [x.rstrip() for x in re.findall(r'\d+\s\.\s\d+\s\.\s*\d*', gold)]
         # replace dots and double ws
         tmp_results = [x.replace('.', '').replace('  ', ' ').rstrip() for x in tmp_results]
         results = []
         for x in tmp_results:
+            month = 0
             if len(x.split()) == 2:
                 day, month = x.split()
-            else:
+            elif len(x.split()) == 3:
                 day, month, year = x.split()
+            else:
+                day = x
 
-            if 0 < int(day) < 32 and 0 < int(month) < 13:
+            if 0 < int(day) < 32 and 0 <= int(month) < 13:
                 results.append(x)
         return results
 
@@ -709,74 +734,6 @@ if __name__ == '__main__':
         alignments.append(TransNorm(t['gold'], t['asr'], t['recog'], t['path'], 2))
     # %%
 
-    def transform_date(date_str):
-        # 1 první
-        # 2 druhý
-        # 3 třetí
-        # 4 čtvrtý
-        # 5 pátý
-        # 6 šestý
-        # 7 sedmý
-        # 8	osmý
-        # 9 devátý
-        # 10 desátý
-        # 11 jedenáctý
-        # 12 dvanáctý
-        # 13 třináctý
-        # 14 čtrnáctý
-        # 15 patnáctý
-        # 16 šestnáctý
-        # 17 sedmnáctý
-        # 18 osmnáctý
-        # 19 devatenáctý
-        # 20 dvacátý
-        #
-        # 21	jednadvacet, jedenadvacet, dvacet jeden, dvacet jedna	jednadvacátý, jedenadvacátý, dvacátý první, dvacátý prvý
-        # 22	dvaadvacet, dvacet dva	dvaadvacátý, dvacátý druhý
-        # 23	třiadvacet, dvacet tři	třiadvacátý, dvacátý třetí
-        # 24	čtyřiadvacet, dvacet čtyři	čtyřiadvacátý, dvacátý čtvrtý
-        # 25	pětadvacet, dvacet pět	pětadvacátý, dvacátý pátý
-        # 26	šestadvacet, dvacet šest	šestadvacátý, dvacátý šestý
-        # 27	sedmadvacet, dvacet sedm	sedmadvacátý, dvacátý sedmý
-        # 28	osmadvacet, dvacet osm	osmadvacátý, dvacátý osmý
-        # 29	devětadvacet, dvacet devět	devětadvacátý, dvacátý devátý
-        # 30	třicet	třicátý
-
-        replacement_dict_day = {
-            '1': [num2words('1', lang='cz'), ' první',],
-            '2': [num2words('2', lang='cz'), ' druhý',],
-            '3': [num2words('3', lang='cz'), ' třetí',],
-            '4': [num2words('4', lang='cz'), ' čtvrtý', ],
-            '5': [num2words('5', lang='cz'), ' pátý', ],
-            '6': [num2words('6', lang='cz'), ' šestý', ],
-            '7': [num2words('7', lang='cz'), ' sedmý', ],
-            '8': [num2words('8', lang='cz'), '	osmý', ],
-            '9': [num2words('9', lang='cz'), ' devátý', ],
-            '10': [num2words('10', lang='cz'), ' desátý', ],
-            '11': [num2words('11', lang='cz'), ' jedenáctý', ],
-            '12': [num2words('12', lang='cz'), ' dvanáctý', ],
-            '13': [num2words('13', lang='cz'), ' třináctý', ],
-            '14': [num2words('14', lang='cz'), ' čtrnáctý', ],
-            '15': [num2words('15', lang='cz'), ' patnáctý', ],
-            '16': [num2words('16', lang='cz'), ' šestnáctý', ],
-            '17': [num2words('17', lang='cz'), ' sedmnáctý', ],
-            '18': [num2words('18', lang='cz'), ' osmnáctý', ],
-            '19': [num2words('19', lang='cz'), ' devatenáctý', ],
-            '20': [num2words('20', lang='cz'), ' dvacátý', ],
-            '21': [num2words('21', lang='cz'), ],
-            '22': [num2words('22', lang='cz'), ],
-            '23': [num2words('23', lang='cz'), ],
-            '24': [num2words('24', lang='cz'), ],
-            '25': [num2words('25', lang='cz'), ],
-            '26': [num2words('26', lang='cz'), ],
-            '27': [num2words('27', lang='cz'), ],
-            '28': [num2words('28', lang='cz'), ],
-            '29': [num2words('29', lang='cz'), ],
-            '30': [num2words('30', lang='cz'), ],
-            '31': [num2words('31', lang='cz'), ],
-        }
-        return None
-
     # 0 , 5 promile ... nula pět promile
     # původních nějakých 6 , 50 Kč na až nějakých 12 , 50 Kč ... způvodních nějakých šest korun padesáti na až nějakých dvanáct korunu padesát
     # 54 , 58 Kč ... padesát čtyři korun padesát osm ale čtú
@@ -822,11 +779,63 @@ if __name__ == '__main__':
             continue
         nums_cnt += 1
         if a._find_dates(a.gold_transcript):
-            date_lst.append([a._find_dates(a.gold_transcript), a.gold_transcript])
+            date_lst.append([a._find_dates(a.gold_transcript), a.gold_transcript, a.recognized_transcript])
         if a._find_times(a.asr_transcript):
             times_lst.append([a._find_times(a.asr_transcript), a.gold_transcript])
         if a._find_floats(a.gold_transcript):
             float_lst.append([a._find_floats(a.gold_transcript), a.gold_transcript])
+    # find dates XX. mesice
+    # %%
+    cnt = 0
+    for a in alignments:
+        if re.findall('\d\s\.\s[^\dA-Z]', a.gold_transcript) and \
+                a._find_month_dates(a.gold_transcript) == [] and \
+                a._find_dates(a.gold_transcript) == []:
+            print(cnt)
+            print(a.gold_transcript)
+            print(a.recognized_transcript)
+            print('---'*40)
+            cnt += 1
+
+
+
+    # problems with dates in form " 23. ledna"
+    # the number 23 can be in multiple places, need to expand it separately at the end using the context
+    # also handle ordered numbers
+    # cnt = 0
+    # for i, (dates, b, c) in enumerate(date_lst):
+    #
+    #     dates_counter = Counter(x for d in dates for x in d.split())
+    #     digits = TransNorm._find_digits(b)
+    #     digits_counter = Counter(digits)
+    #     keys = []
+    #     for d, n in dates_counter.items():
+    #         if n < digits_counter[d]:
+    #             keys.append(d)
+    #     collision = False
+    #     for k in keys:
+    #         if k in dates:
+    #             collision = True
+    #     if collision:
+    #         print(cnt, i)
+    #         ic(keys)
+    #         ic(dates)
+    #         ic(dates_counter)
+    #         ic(digits_counter)
+    #         print(b)
+    #         print(c)
+    #         print('---'*40)
+    #         cnt += 1
+
+    # %%
+    # cnt = 0
+    # for a in alignments:
+    #     if re.findall('\d+\s:\s\d+', a.gold_transcript) != []:
+    #         print(cnt)
+    #         print(a.gold_transcript)
+    #         print(a.recognized_transcript)
+    #         print('---'*40)
+    #         cnt += 1
 
     # %%
     # try:
