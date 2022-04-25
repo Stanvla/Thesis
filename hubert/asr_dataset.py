@@ -199,8 +199,22 @@ class TransNorm:
     def _find_times(trans, time=False):
         # \d is digit
         if time:
-            return re.findall(r"\d+\.\d+ hodin", trans)
-        return re.findall(r"\d+\.\d+", trans)
+            result = re.findall(r"\d+\.\d+ hod[in]*", trans)
+        else:
+            result = re.findall(r"\d+\.\d+", trans)
+
+        new_result = []
+        for r in result:
+            if not time:
+                x, y = r.split('.')
+            else:
+                # todo correct replacement
+                x, y = r.replace(' hodin', '').split('.')
+
+            if len(x) == 2 and len(y) == 2:
+                new_result.append(r)
+        return new_result
+
 
     @staticmethod
     def _find_floats(gold):
@@ -266,7 +280,7 @@ class TransNorm:
         tmp_results = [x for x in re.findall(float_base_regex, gold) if gold.startswith(x)]
         raw_results.extend(tmp_results)
         tmp_results, _ = clean_floats_and_str(tmp_results, gold)
-        results.append(tmp_results)
+        results.extend(tmp_results)
 
         return results
 
@@ -779,23 +793,27 @@ if __name__ == '__main__':
             continue
         nums_cnt += 1
         if a._find_dates(a.gold_transcript):
-            date_lst.append([a._find_dates(a.gold_transcript), a.gold_transcript, a.recognized_transcript])
+            date_lst.append([a._find_dates(a.gold_transcript), a])
+
         if a._find_times(a.asr_transcript):
-            times_lst.append([a._find_times(a.asr_transcript), a.gold_transcript])
+            if a._find_times(a.asr_transcript, time=True):
+                times_lst.append([a._find_times(a.asr_transcript, time=True), a])
+            else:
+                times_lst.append([a._find_times(a.asr_transcript), a])
+
         if a._find_floats(a.gold_transcript):
-            float_lst.append([a._find_floats(a.gold_transcript), a.gold_transcript])
+            float_lst.append([a._find_floats(a.gold_transcript), a])
     # find dates XX. mesice
     # %%
     cnt = 0
-    for a in alignments:
-        if re.findall('\d\s\.\s[^\dA-Z]', a.gold_transcript) and \
-                a._find_month_dates(a.gold_transcript) == [] and \
-                a._find_dates(a.gold_transcript) == []:
-            print(cnt)
-            print(a.gold_transcript)
-            print(a.recognized_transcript)
-            print('---'*40)
-            cnt += 1
+    for p, a in times_lst:
+        # if any([re.findall(r'\.0[1-9]', x) != [] for x in p]):
+        print(cnt)
+        print(p)
+        print(a.gold_transcript)
+        print(a.recognized_transcript)
+        print('---'*40)
+        cnt += 1
 
 
 
