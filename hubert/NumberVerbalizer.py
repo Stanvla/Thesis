@@ -10,8 +10,21 @@ import copy
 import time
 
 
-def cartesian_product_basic(left, right):
-    return left.assign(key=1).merge(right.assign(key=1), on='key').drop('key', 1)
+def df_tag_split(df):
+    df[['cas', 'gen', 'num']] = df.tag.str.split('|', expand=True)
+    return df
+
+
+def add_words_df(col, words, df, prefix=True, extend=False):
+    dfs = [df] if extend else []
+    for w in words:
+        tmp_df = df.copy()
+        if prefix:
+            tmp_df[col] = w + ' ' + tmp_df[col]
+        else:
+            tmp_df[col] += ' ' + w
+        dfs.append(tmp_df)
+    return pd.concat(dfs)
 
 
 def get_request_morphodita(words, num=True):
@@ -140,7 +153,7 @@ def filter_num_df(df, nums_verb):
     return pd.concat(filtered_dfs)
 
 
-def merge_tag_subset(df1, df2, df1_src_col, df2_src_col, tag_subset, trg_col='time'):
+def merge_tag_subset(df1, df2, df1_src_col, df2_src_col, tag_subset, trg_col='time', replace_tag=False):
     def new_tag(df):
         df['tmp_tag'] = ''
         for i, t in enumerate(tag_subset):
@@ -154,6 +167,9 @@ def merge_tag_subset(df1, df2, df1_src_col, df2_src_col, tag_subset, trg_col='ti
 
     result = df1.merge(df2, how='left', on='tmp_tag')
     result[trg_col] = result[df1_src_col] + ' ' + result[df2_src_col]
+    if replace_tag:
+        result['tag'] = result.tmp_tag
+        result = result.drop(['tmp_tag'], 1)
     return result[result[trg_col].notna()].drop_duplicates()
 
 
@@ -320,8 +336,7 @@ def natural_num_verbalization(num, orders_groups, orders_groups_names, ord_base,
         result_dict, highest = expand_group(group, result_dict, ord_num, german_version)
 
         if highest is not None:
-            # first add group name to all variants of a number restricted to a group
-            # dva -> dva tisíc
+            # first add group name to all variants of a number restricted to a group: dva -> dva tisíc
             group_with_name_lst = []
             for x in result_dict[highest]:
                 # todo check
@@ -354,6 +369,11 @@ def n2w_cardinal_morphodita(num, german_version=True):
             result.append(gen_all_comb(verb_num, df))
         return pd.concat(result).reset_index(drop=True)
 
+    def replace_extend(df, repl_src, repl_target):
+        tmp_df = df.copy()
+        tmp_df.form0 = tmp_df.fom0.str.replace(repl_src, repl_target)
+        return pd.concat([df, tmp_df])
+
     # Ve větné souvislosti se víceslovné číslovkové výrazy zpravidla skloňují. Máme více možností:
     #
     #   case_1) Skloňujeme všechny části výrazu.
@@ -377,65 +397,43 @@ def n2w_cardinal_morphodita(num, german_version=True):
     if isinstance(num, str):
         num = int(num)
     orders_groups, orders_groups_names, ord_base, ord_num = get_orders(num)
-    if sum(ord_num.values()) == 0:
-        case_1 = ['nula']
-    else:
+
+    case_1 = ['nula']
+    if sum(ord_num.values()) != 0:
         case_1 = natural_num_verbalization(num, orders_groups, orders_groups_names, ord_base, ord_num, german_version)
     all_results = get_all_variants_morphodita(case_1)
 
     # if number is smaller than 100, then case_2 and case_3 are done by default in case_1
-    case_2 = None
     if num > 100 and num % 100 != 0:
-        # need to handle tisic/jedna tisic, milion/jeden milion,
         new_num = num % 100
         num_reminder = num - new_num
         rest = n2w(num_reminder)
-        case_2_copy = None
-        base_tag = '1|sing'
-        if new_num != 0:
-            orders_groups, orders_groups_names, ord_base, ord_num = get_orders(new_num)
-            case_2 = natural_num_verbalization(new_num, orders_groups, orders_groups_names, ord_base, ord_num, german_version, alt_hundreds=False)
-            case_2 = get_all_variants_morphodita(case_2)
-            case_2_copy = case_2.copy()
-            case_2.form0 = rest + ' ' + case_2.form0
-        else:
-            case_2 = pd.DataFrame(dict(tag=base_tag, form0=rest))
 
+        orders_groups, orders_groups_names, ord_base, ord_num = get_orders(new_num)
+        case_2 = natural_num_verbalization(new_num, orders_groups, orders_groups_names, ord_base, ord_num, german_version, alt_hundreds=False)
+        case_2 = get_all_variants_morphodita(case_2)
+        case_2.form0 = rest + ' ' + case_2.form0
+        case_2_copy = case_2.copy()
+
+        # need to handle tisic/jedna tisic, milion/jeden milion,
         if num // 10**3 == 1:
-            tmp_df = case_2.copy()
-            tmp_df.form0 = tmp_df.form0.str.replace('tisíc', 'jeden tisíc')
-            case_2 = pd.concat([case_2, tmp_df])
+            case_2 = replace_extend(case_2, 'tisíc', 'jeden tisíc')
         if num // 10**6 == 1:
-            tmp_df = case_2.copy()
-            tmp_df.form0 = tmp_df.form0.str.replace('milion', 'jeden milion')
-            case_2 = pd.concat([case_2, tmp_df])
+            case_2 = replace_extend(case_2, 'milion', 'jeden milion')
         if num // 10**9 == 1:
-            tmp_df = case_2.copy()
-            tmp_df.form0 = tmp_df.form0.str.replace('miliarda', 'jedna miliarda')
-            case_2 = pd.concat([case_2, tmp_df])
+            case_2 = replace_extend(case_2, 'miliarda', 'jedna miliarda')
         if num // 10**12 == 1:
-            tmp_df = case_2.copy()
-            tmp_df.form0 = tmp_df.form0.str.replace('bilion', 'jeden bilion')
-            case_2 = pd.concat([case_2, tmp_df])
+            case_2 = replace_extend(case_2, 'bilion', 'jeden bilion')
 
         # case for 1100 <= num < 2000
         orders_groups, orders_groups_names, ord_base, ord_num = get_orders(num_reminder)
         alt_hundreds = alt_hundreds_1100_2000(num_reminder, orders_groups, ord_base, ord_num, german_version=False)
         if alt_hundreds:
-            if case_2_copy is not None:
-                tmp_dfs = []
-                for alt_h in alt_hundreds:
-                    tmp_df = case_2_copy.copy()
-                    tmp_df.form0 = alt_h.replace('sto', 'set') + ' ' + tmp_df.form0
-                    tmp_dfs.append(tmp_df)
-                tmp_dfs = pd.concat(tmp_dfs)
-                case_2 = pd.concat([case_2, tmp_dfs])
-            else:
-                tmp_df = pd.DataFrame([dict(form0=alh.replace('sto', 'set'), tag=base_tag) for alh in alt_hundreds])
-                case_2 = pd.concat([case_2, tmp_df])
+            tmp_df = add_words_df('form0', [x.replace('sto', 'set') for x in alt_hundreds], case_2_copy, prefix=True)
+            case_2 = pd.concat([case_2, pd.concat(tmp_df)])
 
-    if case_2 is not None:
         all_results = pd.concat([all_results, case_2])
+
     return all_results.drop_duplicates(ignore_index=True).sort_values('tag').reset_index(drop=True)
 
 
@@ -500,143 +498,79 @@ def n2w_ordinal_morphodita(num, base_variant_only=True):
         base_variants[i] = [h + ' ' + v for v in base_variants[tens_units] for h in base_variants[hundreds]]
     if base_variant_only:
         return base_variants[num]
-    else:
-        return pd.concat([get_request_morphodita(v, num=False) for v in base_variants[num]])
-
-
-def df_tag_split(df):
-    df[['cas', 'gen', 'num']] = df.tag.str.split('|', expand=True)
-    return df
-
-
-def add_words_df(col, words, df, prefix=True):
-    dfs = []
-    for w in words:
-        tmp_df = df.copy()
-        if prefix:
-            tmp_df[col] = w + ' ' + tmp_df[col]
-        else:
-            tmp_df[col] += ' ' + w
-        dfs.append(tmp_df)
-    return pd.concat(dfs)
+    return pd.concat([get_request_morphodita(v, num=False) for v in base_variants[num]])
 
 
 def n2w_times_morphodita(hours, minutes, unique=False):
     valid_columns = ['tag', 'time']
+    used_tags = ['cas', 'gen']
     hours_int = int(hours)
     minutes_int = int(minutes)
-    hours_morph_df = n2w_cardinal_morphodita(hours)
 
+    hours_morph_df = n2w_cardinal_morphodita(hours)
+    hours_words_df = get_request_morphodita('hodina', num=False)
     # handle hours_int % 12
     if hours_int > 12:
         hours_morph_df = pd.concat([hours_morph_df, n2w_cardinal_morphodita(hours_int % 12)])
 
     minutes_morph_df = n2w_cardinal_morphodita(minutes)
-    hours_words_df = get_request_morphodita('hodina', num=False)
     minutes_words_df = get_request_morphodita('minuta', num=False)
-
-    hours_morph_df = df_tag_split(hours_morph_df)
-    hours_morph_df.tag = hours_morph_df.cas + '|' + hours_morph_df.gen
-
-    minutes_morph_df = df_tag_split(minutes_morph_df)
-    minutes_morph_df.tag = minutes_morph_df.cas + '|' + minutes_morph_df.gen
 
     # handling zeros
     if '0' == minutes[0]:
+        minutes_morph_df = add_words_df('form0', ['nula'], minutes_morph_df, prefix=True, extend=True)
         if minutes == '00':
             minutes_morph_df.form0 = 'nula nula'
-        else:
-            tmp_df = minutes_morph_df.copy()
-            tmp_df.form0 = 'nula ' + tmp_df.form0
-            minutes_morph_df = pd.concat([minutes_morph_df, tmp_df])
-
+            minutes_morph_df = minutes_morph_df.drop_duplicates()
 
     # case: no "hours", "minutes", both numbers in the same case
-    nums_by_case_short_df = hours_morph_df.merge(minutes_morph_df, how='left', on='tag')
-    nums_by_case_short_df['time'] = nums_by_case_short_df.form0_x + ' ' + nums_by_case_short_df.form0_y
+    nums_by_case_short_df = merge_tag_subset(hours_morph_df, minutes_morph_df, 'form0_x', 'form0_y', used_tags, 'time', replace_tag=True)
     # can have "hodin" at the end
-    tmp_df = nums_by_case_short_df.copy()
-    tmp_df.time = tmp_df.time + ' ' + 'hodin'
-    nums_by_case_short_df = pd.concat([nums_by_case_short_df, tmp_df])
-    nums_by_case_short_df = nums_by_case_short_df[valid_columns]
-    nums_by_case_short_df = nums_by_case_short_df.dropna()
+    nums_by_case_short_df = add_words_df('time', ['hodin'], nums_by_case_short_df, prefix=False, extend=True)
+    nums_by_case_short_df = nums_by_case_short_df[valid_columns].dropna()
 
     # case: two groups, hours_int with hours_word in the correct case and minutes_int and minutes_word in the correct case
     hours_int_word_df = n2w_cardinal_morphodita(hours_int)
-    if hours_int == 1:
-        hours_int_word_df = add_words_df('form0', ['hodina', 'hodinu'], hours_int_word_df, False)
-    elif 1 < hours_int < 5:
-        hours_int_word_df.form0 += ' hodiny'
-    else:
-        hours_int_word_df.form0 += ' hodin'
-
+    hours_int_word_df = num_with_noun(hours_int_word_df, hours_words_df)
+    hours_int_word_df = add_words_df('time', ['a'], hours_int_word_df, prefix=False, extend=True)
     # also handle hours_int % 12
     if hours_int > 12:
         hours_int_alt = hours_int % 12
         tmp_df = n2w_cardinal_morphodita(hours_int_alt)
-        if hours_int_alt == 1:
-            tmp_df = add_words_df('form0', ['hodina', 'hodinu'], tmp_df, False)
-        elif 1 < hours_int_alt < 5:
-            tmp_df.form0 += ' hodiny'
-        else:
-            tmp_df.form0 += ' hodin'
+        tmp_df = num_with_noun(tmp_df, hours_words_df)
         hours_int_word_df = pd.concat([hours_int_word_df, tmp_df])
-    hours_int_word_df = df_tag_split(hours_int_word_df)
-    hours_int_word_df.tag = hours_int_word_df.cas + '|' + hours_int_word_df.gen
 
-    minutes_int_word_df = minutes_morph_df.copy()
-    if minutes_int == 1:
-        minutes_int_word_df = add_words_df('form0', ['minuta', 'minutu'], minutes_int_word_df, False)
-    elif 1 < minutes_int < 5:
-        minutes_int_word_df.form0 += ' minuty'
-    else:
-        minutes_int_word_df.form0 += ' minut'
-
-    nums_by_case_full_df = hours_int_word_df.merge(minutes_int_word_df, how='left', on='tag')
-    nums_by_case_full_df['time'] = nums_by_case_full_df.form0_x + ' ' + nums_by_case_full_df.form0_y
+    minutes_int_word_df = num_with_noun(minutes_morph_df, minutes_words_df)
+    nums_by_case_full_df = merge_tag_subset(hours_int_word_df, minutes_int_word_df, 'time_x', 'time_y', used_tags, replace_tag=True)
 
     hours_int_word_conj_df = hours_int_word_df.copy()
-    hours_int_word_conj_df.form0 += ' a'
-
-    tmp_df = hours_int_word_conj_df.merge(minutes_int_word_df, how='left', on='tag')
-    tmp_df['time'] = tmp_df.form0_x + ' ' + tmp_df.form0_y
+    hours_int_word_conj_df.time += ' a'
+    tmp_df = merge_tag_subset(hours_int_word_conj_df, minutes_int_word_df, 'time_x', 'time_y', used_tags, replace_tag=True)
 
     nums_by_case_full_df = pd.concat([nums_by_case_full_df, tmp_df])
-    nums_by_case_full_df = nums_by_case_full_df[valid_columns]
-    nums_by_case_full_df = nums_by_case_full_df.dropna()
-
+    nums_by_case_full_df = nums_by_case_full_df[valid_columns].dropna()
 
     # case: hours only (can have word "hodin")
-    hours_only_df = hours_morph_df.copy()
-    hours_only_df = pd.concat([hours_only_df, hours_int_word_df])
-    hours_only_df['time'] = hours_only_df.form0
-    hours_only_df = hours_only_df[valid_columns]
-    hours_only_df = hours_only_df.dropna()
-
-    if hours_only_df.time.isnull().values.any():
-        raise RuntimeError('nan values in the hours_only')
-
-    result_df = pd.concat([nums_by_case_short_df, nums_by_case_full_df, hours_only_df])
+    hours_morph_df['time'] = hours_morph_df.form0
+    hours_only_df = pd.concat([hours_morph_df.copy(), hours_int_word_df])
+    hours_only_df = hours_only_df[valid_columns].dropna()
 
     # case: ordinal numbers
-    if minutes_int != 0:
-        hours_ordinal_df = n2w_ordinal_morphodita(hours_int, base_variant_only=False)
-        hours_ordinal_word_df = hours_ordinal_df.merge(hours_words_df, how='left', on='tag')
-        hours_ordinal_word_df['time'] = hours_ordinal_word_df.form_x + ' ' + hours_ordinal_word_df.form_y
+    hours_ordinal_df = n2w_ordinal_morphodita(hours_int, base_variant_only=False)
+    hours_ordinal_word_df = hours_ordinal_df.merge(hours_words_df, how='left', on='tag')
+    hours_ordinal_word_df['time'] = hours_ordinal_word_df.form_x + ' ' + hours_ordinal_word_df.form_y
 
+    result_df = pd.concat([nums_by_case_short_df, nums_by_case_full_df, hours_only_df, hours_ordinal_df])
+
+    if minutes_int != 0:
         minutes_ordinal_df = n2w_ordinal_morphodita(minutes_int, base_variant_only=False)
         minutes_ordinal_word_df = minutes_ordinal_df.merge(minutes_words_df, how='left', on='tag')
         minutes_ordinal_word_df['time'] = minutes_ordinal_word_df.form_x + ' ' + minutes_ordinal_word_df.form_y
-
-        tmp_df = minutes_ordinal_word_df.copy()
-        tmp_df.time = 'a ' + tmp_df.time
-        minutes_ordinal_word_df = pd.concat([minutes_ordinal_word_df, tmp_df])
+        minutes_ordinal_word_df = add_words_df('time', ['a'], minutes_ordinal_word_df.copy(), prefix=True, extend=True)
 
         ordinal_df = hours_ordinal_word_df.merge(minutes_ordinal_word_df, how='left', on='tag')
         ordinal_df['time'] = ordinal_df.time_x + ' ' + ordinal_df.time_y
-        ordinal_df = df_tag_split(ordinal_df)
-        ordinal_df = ordinal_df[ordinal_df.cas.isin(['2', '4']) & (ordinal_df.gen == 'fem')]
-        ordinal_df = ordinal_df[valid_columns]
+        ordinal_df = ordinal_df[valid_columns].dropna()
         result_df = pd.concat([result_df, ordinal_df])
 
     # case: quarters and halves
@@ -645,13 +579,14 @@ def n2w_times_morphodita(hours, minutes, unique=False):
         if hours_int_alt == 0:
             hours_int_alt = 12
 
+        # handle halves
         if minutes_int == 30:
-            # handle halves
+            hours_int_alt_df = n2w_ordinal_morphodita(hours_int_alt, base_variant_only=False)
             if hours_int_alt == 1:
-                hours_int_alt_df = n2w_cardinal_morphodita(hours_int_alt)
-                hours_int_alt_df['form'] = hours_int_alt_df.form0
-            else:
-                hours_int_alt_df = n2w_ordinal_morphodita(hours_int_alt, base_variant_only=False)
+                tmp_df = n2w_cardinal_morphodita(hours_int_alt)
+                tmp_df['form'] = tmp_df.form0
+                hours_int_alt_df = pd.concat([hours_int_alt_df, tmp_df])
+
             # extract only correct forms
             hours_int_alt_df = hours_int_alt_df[hours_int_alt_df.tag == '2|fem|sing']
             hours_int_alt_df['time'] = 'půl ' + hours_int_alt_df.form
@@ -668,21 +603,21 @@ def n2w_times_morphodita(hours, minutes, unique=False):
             # use preposition "na"
             quarters_word_df.form = quarters_word_df.form + ' na'
 
-            hours_int_alt_df = df_tag_split(n2w_cardinal_morphodita(hours_int_alt))
+            hours_int_alt_df = n2w_cardinal_morphodita(hours_int_alt)
+            hours_int_alt_df = df_tag_split(hours_int_alt_df)
             hours_int_alt_df = hours_int_alt_df[(hours_int_alt_df.cas == '4') & (hours_int_alt_df.gen == 'fem')]
             unique_hours_alt = hours_int_alt_df.form0.unique()
             if len(unique_hours_alt) == 0:
                 raise RuntimeError('Quarters verbalization: no num verbalization for hours, unique_hours_alt is empty.')
-            alt_df = add_words_df('form', unique_hours_alt, quarters_word_df, prefix=False)
+            alt_df = add_words_df('form', unique_hours_alt, quarters_word_df, prefix=False, extend=False)
 
             if quarters > 1:
                 cardinal_num_df = n2w_cardinal_morphodita(quarters)
-                alt_df = add_words_df('form0', alt_df.form.unique(), cardinal_num_df, prefix=False)
+                alt_df = add_words_df('form0', alt_df.form.unique(), cardinal_num_df, prefix=False, extend=False)
                 alt_df['form'] = alt_df.form0
 
             alt_df['time'] = alt_df.form
             alt_df = alt_df.dropna()
-
             alt_df = alt_df[valid_columns]
 
         result_df = pd.concat([result_df, alt_df])
@@ -703,8 +638,7 @@ def n2w_floats_morphodita(whole, decimal, unique=False):
     decimal_morpho_df = n2w_cardinal_morphodita(decimal_int, german_version=False)
     leading_zeros = ' '.join((len(decimal) - len(decimal.lstrip('0'))) * ['nula'])
     if leading_zeros != '':
-        decimal_morpho_with_zeros_df = add_words_df('form0', [leading_zeros], decimal_morpho_df.copy(), prefix=True)
-        decimal_morpho_df = pd.concat([decimal_morpho_df, decimal_morpho_with_zeros_df])
+        decimal_morpho_df = add_words_df('form0', [leading_zeros], decimal_morpho_df.copy(), prefix=True, extend=True)
 
     decimal_int_word_df = None
     if len(decimal) < 4:
@@ -760,7 +694,7 @@ def n2w_floats_morphodita(whole, decimal, unique=False):
         long_df['tag'] = long_df['tag_x']
         result_dfs.append(long_df[valid_cols])
 
-    result_df = pd.concat(result_dfs)
+    result_df = pd.concat(result_dfs).drop_duplicates().dropna()
     if unique:
         return result_df.time.unique()
     return result_df
@@ -841,7 +775,7 @@ def test_time():
             hours, minutes = k.split('.')
             result = n2w_times_morphodita(hours, minutes, unique=True)
             if v not in result:
-                print(f'XX: {k:>5}, {v:<40} {len(result):>6}')
+                print(f'--: {k:>5}, {v:<40} {len(result):>6}')
             else:
                 print(f'OK: {k:>5}, {v:<40} {len(result):>6}')
             time.sleep(1)
@@ -852,68 +786,64 @@ def test_float():
 
     tests = [
         # todo check
-        #   ["1 , 82", "jedním celým osmdesáti dvěma setinamy"],
+          ["1 , 82", "jedním celým osmdesáti dvěma setinami"],
 
-        # todo hard
-        #   ["1 , 163", "jedna celá sto šedesát třech"],
+         ["0 , 0042", "nula celá nula nula čtyřicet dva"],
+         ["2 , 072", "dvě celé nula sedmdesát dva"],
+         ["9 , 209", "devět celých dvěstě devět"],
+         ["32 , 5", "třicet dva a půl"],
+         ["1 , 233", "jedna celá dvěstě třicet tři"],
+         ["3 , 164", "tři celé sto šedesát čtyři"],
+         ["1 , 023", "jedna celá nula dvacet tři"],
 
-        #  ["0 , 0042", "nula celá nula nula čtyřicet dva"],
-        #  ["2 , 072", "dvě celé nula sedmdesát dva"],
-        #  ["9 , 209", "devět celých dvěstě devět"],
-        #  ["32 , 5", "třicet dva a půl"],
-        #  ["1 , 233", "jedna celá dvěstě třicet tři"],
-        #  ["3 , 164", "tři celé sto šedesát čtyři"],
-        #  ["1 , 023", "jedna celá nula dvacet tři"],
-        #
-        # ["0 , 1",  "jednu desetinu"],
-        # ["0 , 001", "nula celá nula nula jedna"],
-        # ["0 , 0001", "nula celá nula nula nula jedna"],
-        # ["0 , 005", "nula celá nula nula pět"],
-        # ["0 , 004", "nula celá nula nula čtyři"],
-        # ["0 , 0006", "nula celá nula nula nula šest"],
-        #
-        # ["0 , 055", "nula celá nula padesát pět tisícin"],
-        # ["0 , 3",  "žádná celá tři desetiny"],
-        # ["1 , 4",  "jedna celá čtyři desetiny"],
-        # ["80 , 4",  "osmdesát celých čtyři desetin"],
-        #
-        # ["0 , 9",  "žádná celá devět"],
-        # ["0 , 7",  "žádná celá sedm"],
-        # ["0 , 77",  "žádná celá sedmdesát sedm"],
-        # ["0 , 8",  "žádná celá osm"],
-        # ["0 , 4",  "žádná celá čtyři"],
-        # ["0 , 11",  "žádná celá jedenáct"],
-        #
-        # ["1 , 5", "jeden a půl"],
-        # ["2 , 5", "dva a půl"],
-        # ["8 , 5", "osm a půl"],
-        # ["3 , 5", "tři a půl"],
-        # ["13 , 5", "třináct a půl"],
-        # ["11 , 5", "jedenácti a půl"],
-        # ["2 , 5", "dvě a půl"],
-        #
-        # ["70 , 6", "sedmdesát celých šest"],
-        #
-        #
-        # ["2 , 1",  "dvě celé jedna desetina"],
-        # ["4 , 3",  "čtyři celé tři desetiny"],
-        # ["2 , 7",  "dvě celé sedm desetin"],
-        # ["9 , 3",  "devět celé tři desetiny"],
-        # ["3 , 4",  "tři celé čtyři desetiny"],
-        # ["0 , 9",  "žádná celá devět desetin"],
-        # ["3 , 6",  "tři celé šest desetin"],
-        #
-        # ["0 , 00103", "nula celá nula nula sto tři"],
-        #
-        # ["1 , 440", "jedna celá čtyřista čtyřicet"],
-        # ["1 , 285", "jedna celá dvěstě osmdesát pět"],
-        # ["1 , 748", "jedna celá sedmset čtyřicet osm"],
-        # ["0 , 012", "nula celá nula dvanáct"],
-        # ["0 , 506", "nula celá pětset šest"],
-        # ["0 , 521", "nula celá pětset dvacet jedna"],
-        # ["1 , 031", "jedna celá nula třicet jedna"],
-        # ["4 , 185", "čtyři celé sto osmdesát pět"],
-        # ["5 , 265", "pět celý dvěstě šedesát pět"],
+        ["0 , 1",  "jednu desetinu"],
+        ["0 , 001", "nula celá nula nula jedna"],
+        ["0 , 0001", "nula celá nula nula nula jedna"],
+        ["0 , 005", "nula celá nula nula pět"],
+        ["0 , 004", "nula celá nula nula čtyři"],
+        ["0 , 0006", "nula celá nula nula nula šest"],
+
+        ["0 , 055", "nula celá nula padesát pět tisícin"],
+        ["0 , 3",  "žádná celá tři desetiny"],
+        ["1 , 4",  "jedna celá čtyři desetiny"],
+        ["80 , 4",  "osmdesát celých čtyři desetin"],
+
+        ["0 , 9",  "žádná celá devět"],
+        ["0 , 7",  "žádná celá sedm"],
+        ["0 , 77",  "žádná celá sedmdesát sedm"],
+        ["0 , 8",  "žádná celá osm"],
+        ["0 , 4",  "žádná celá čtyři"],
+        ["0 , 11",  "žádná celá jedenáct"],
+
+        ["1 , 5", "jeden a půl"],
+        ["2 , 5", "dva a půl"],
+        ["8 , 5", "osm a půl"],
+        ["3 , 5", "tři a půl"],
+        ["13 , 5", "třináct a půl"],
+        ["11 , 5", "jedenácti a půl"],
+        ["2 , 5", "dvě a půl"],
+
+        ["70 , 6", "sedmdesát celých šest"],
+
+        ["2 , 1",  "dvě celé jedna desetina"],
+        ["4 , 3",  "čtyři celé tři desetiny"],
+        ["2 , 7",  "dvě celé sedm desetin"],
+        ["9 , 3",  "devět celé tři desetiny"],
+        ["3 , 4",  "tři celé čtyři desetiny"],
+        ["0 , 9",  "žádná celá devět desetin"],
+        ["3 , 6",  "tři celé šest desetin"],
+
+        ["0 , 00103", "nula celá nula nula sto tři"],
+
+        ["1 , 440", "jedna celá čtyřista čtyřicet"],
+        ["1 , 285", "jedna celá dvěstě osmdesát pět"],
+        ["1 , 748", "jedna celá sedmset čtyřicet osm"],
+        ["0 , 012", "nula celá nula dvanáct"],
+        ["0 , 506", "nula celá pětset šest"],
+        ["0 , 521", "nula celá pětset dvacet jedna"],
+        ["1 , 031", "jedna celá nula třicet jedna"],
+        ["4 , 185", "čtyři celé sto osmdesát pět"],
+        ["5 , 265", "pět celý dvěstě šedesát pět"],
     ]
 
     for k, v in tests:
