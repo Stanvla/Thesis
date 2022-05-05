@@ -806,7 +806,7 @@ if __name__ == '__main__':
     # find dates XX. mesice
     # %%
     cnt = 0
-    for p, a in times_lst:
+    for p, a in date_lst:
         # if any([re.findall(r'\.0[1-9]', x) != [] for x in p]):
         print(cnt)
         print(p)
